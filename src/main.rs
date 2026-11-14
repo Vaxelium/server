@@ -18,7 +18,7 @@ use tokio::sync::broadcast;
 
 const MAX_TEXT_LEN: usize = 2000;
 const MAX_SERVER_NAME_LEN: usize = 40;
-const DEFAULT_DB_PATH: &str = "disscord.db";
+const DEFAULT_DB_PATH: &str = "vaxelium.db";
 /// How long a session confirmed by the auth service keeps working on this server while the auth
 /// service cannot be reached.
 const SESSION_CACHE_SECS: u64 = 24 * 60 * 60;
@@ -75,7 +75,7 @@ struct ServerConfig {
 ///
 /// With COUNT above 1, one process runs that many servers on consecutive ports, starting at
 /// ADDR's port. Each gets its own database (DB_PATH with its port in the name) and its own
-/// discovery port (the next one up from DISSCORD_DISCOVERY_PORT).
+/// discovery port (the next one up from VAXELIUM_DISCOVERY_PORT).
 fn main() -> anyhow::Result<()> {
     // Read .env before the runtime starts any threads.
     common::env::load();
@@ -107,16 +107,16 @@ async fn run() -> anyhow::Result<()> {
         .rsplit_once(':')
         .ok_or_else(|| anyhow::anyhow!("ADDR must look like host:port"))?;
     let port: u16 = port.parse()?;
-    // Servers to start from, for finding others across the internet: DISSCORD_PEERS=host:port,host:port
-    let peers: Vec<String> = std::env::var("DISSCORD_PEERS")
+    // Servers to start from, for finding others across the internet: VAXELIUM_PEERS=host:port,host:port
+    let peers: Vec<String> = std::env::var("VAXELIUM_PEERS")
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
         .filter(|a| !a.is_empty())
         .map(String::from)
         .collect();
-    let discovery_base: u16 = env_number("DISSCORD_DISCOVERY_PORT", DISCOVERY_PORT);
-    let exchange_secs: u64 = env_number("DISSCORD_EXCHANGE_SECS", 30);
+    let discovery_base: u16 = env_number("VAXELIUM_DISCOVERY_PORT", DISCOVERY_PORT);
+    let exchange_secs: u64 = env_number("VAXELIUM_EXCHANGE_SECS", 30);
 
     // Every server in this group, by address.
     let group: Vec<String> = (0..count)
@@ -135,7 +135,7 @@ async fn run() -> anyhow::Result<()> {
         let server_addr = group[i as usize].clone();
         let config = ServerConfig {
             advertise: if count == 1 {
-                std::env::var("DISSCORD_ADVERTISE").unwrap_or_else(|_| lan_address(&server_addr))
+                std::env::var("VAXELIUM_ADVERTISE").unwrap_or_else(|_| lan_address(&server_addr))
             } else {
                 lan_address(&server_addr)
             },
@@ -146,7 +146,7 @@ async fn run() -> anyhow::Result<()> {
                 .checked_add(i)
                 .ok_or_else(|| anyhow::anyhow!("too many servers for the discovery port"))?,
             exchange_secs,
-            // The first server of a group starts from DISSCORD_PEERS and knows every other server in
+            // The first server of a group starts from VAXELIUM_PEERS and knows every other server in
             // the group. The others find the rest of the group through it.
             peers: if i == 0 {
                 peers.iter().cloned().chain(group.iter().skip(1).cloned()).collect()
@@ -208,7 +208,7 @@ async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
     let (tx, _) = broadcast::channel::<ServerMsg>(256);
 
     let listener = TcpListener::bind(&addr).await?;
-    println!("DissCord server listening on {addr} (TLS, known to others as {advertise}), storing data in {db_path}, accounts from {auth_addr}");
+    println!("Vaxelium server listening on {addr} (TLS, known to others as {advertise}), storing data in {db_path}, accounts from {auth_addr}");
 
     loop {
         let (socket, peer) = listener.accept().await?;
@@ -235,13 +235,13 @@ async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
     }
 }
 
-/// `disscord.db` with a port in its name: `disscord-7879.db`.
+/// `vaxelium.db` with a port in its name: `vaxelium-7879.db`.
 fn numbered_path(db_path: &str, port: u16) -> String {
     let path = std::path::Path::new(db_path);
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "disscord".into());
+        .unwrap_or_else(|| "vaxelium".into());
     let name = match path.extension() {
         Some(ext) => format!("{stem}-{port}.{}", ext.to_string_lossy()),
         None => format!("{stem}-{port}"),
