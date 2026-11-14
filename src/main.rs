@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::{
+    ChannelRef,
     AuthReply, AuthRequest, ChatMessage, ClientMsg, DirectMessage, ServerMsg, UserStatus, DEFAULT_ADDR,
     DEFAULT_AUTH_ADDR,
     DISCOVERY_PORT, MAX_SERVER_DESCRIPTION_LEN, MAX_SERVER_ICON_LEN,
@@ -208,6 +209,20 @@ async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
     // Every connection subscribes to this and forwards events for its own channel.
     let (tx, _) = broadcast::channel::<ServerMsg>(256);
 
+    // Members the auth service gave a random id since this server last ran: move what this server
+    // stored under the old id to the new one. Needs the auth service; tried again on the next start.
+    let legacy = state.lock().unwrap().db.legacy_ids()?;
+    if !legacy.is_empty() {
+        match auth_call(&state, &auth_addr, &AuthRequest::Migrations { old_ids: legacy }).await {
+            Ok(AuthReply::Migrations { pairs }) => {
+                let changed = state.lock().unwrap().db.apply_id_map(&pairs)?;
+                println!("updated {} member id(s) to their new ids ({changed} references)", pairs.len());
+            }
+            Ok(_) => eprintln!("unexpected reply from the auth service about member ids"),
+            Err(e) => eprintln!("could not update member ids yet ({e}); will try again on the next start"),
+        }
+    }
+
     let listener = TcpListener::bind(&addr).await?;
     println!("Vaxelium server listening on {addr} (TLS, known to others as {advertise}), storing data in {db_path}, accounts from {auth_addr}");
 
@@ -315,10 +330,13 @@ where
     };
 
     let mut channel = "general".to_string();
+    let mut channel_id = state.lock().unwrap().db.ensure_channel(&channel)?;
     // Removes the user and broadcasts presence on every exit path, including errors.
     let _online = OnlineGuard { state: state.clone(), tx: tx.clone(), user: user.clone() };
     let server_public = state.lock().unwrap().db.is_public().unwrap_or(false);
+    let server_id = state.lock().unwrap().db.info_value("server_id")?.unwrap_or_default();
     let welcome = ServerMsg::Welcome {
+        server_id,
         name: display.clone(),
         user_id: user.clone(),
         server_name,
@@ -338,7 +356,7 @@ where
     send(&mut writer, &ServerMsg::DirectMessages { list: direct_message_list(&state, &user)? }).await?;
     let _ = tx.send(ServerMsg::Presence { users });
     let _ = tx.send(ServerMsg::System {
-        channel: channel.clone(),
+        channel_id,
         text: format!("{user} connected"),
     });
 
@@ -400,15 +418,17 @@ where
                                 } else {
                                     let s = state.lock().unwrap();
                                     let joined = s.db.open_direct_message(&user, &other)?;
-                                    let history = s.db.history(&joined)?;
-                                    Ok((joined, history))
+                                    let id = s.db.ensure_channel(&joined)?;
+                                    let history = s.db.history(id)?;
+                                    Ok((joined, id, history))
                                 }
                             }
                         };
                         match opened {
-                            Ok((joined, history)) => {
+                            Ok((joined, id, history)) => {
                                 channel = joined.clone();
-                                send(&mut writer, &ServerMsg::Joined { channel: joined, history }).await?;
+                                channel_id = id;
+                                send(&mut writer, &ServerMsg::Joined { channel: ChannelRef { id, name: joined }, history }).await?;
                                 send(&mut writer, &ServerMsg::DirectMessages { list: direct_message_list(&state, &user)? }).await?;
                             }
                             Err(text) => send(&mut writer, &ServerMsg::Error { text }).await?,
@@ -419,7 +439,8 @@ where
                         let history = {
                             let s = state.lock().unwrap();
                             if s.db.is_direct_message_member(&channel, &user)? {
-                                Some(s.db.history(&channel)?)
+                                let id = s.db.ensure_channel(&channel)?;
+                                Some(s.db.history(id)?)
                             } else {
                                 None
                             }
@@ -435,12 +456,12 @@ where
                     }
 
                     ClientMsg::ListChannels => {
-                        let (channels, categories) = {
+                        let (channels, categories, uncategorized) = {
                             let s = state.lock().unwrap();
-                            (s.db.channel_names()?, s.db.categories()?)
+                            (s.db.channel_list()?, s.db.categories()?, s.db.uncategorized_channels()?)
                         };
                         send(&mut writer, &ServerMsg::Channels { channels }).await?;
-                        send(&mut writer, &ServerMsg::Categories { categories }).await?;
+                        send(&mut writer, &ServerMsg::Categories { categories, uncategorized }).await?;
                     }
 
                     ClientMsg::CreateCategory { name } => {
@@ -453,15 +474,15 @@ where
                             continue;
                         }
                         let added = state.lock().unwrap().db.create_category(&name)?;
-                        if added {
+                        if added.is_some() {
                             broadcast_categories(&state, &tx)?;
                         } else {
                             send(&mut writer, &ServerMsg::Error { text: "a category with that name already exists".into() }).await?;
                         }
                     }
 
-                    ClientMsg::DeleteCategory { name } => {
-                        let removed = state.lock().unwrap().db.delete_category(name.trim())?;
+                    ClientMsg::DeleteCategory { category } => {
+                        let removed = state.lock().unwrap().db.delete_category(category)?;
                         if removed {
                             broadcast_categories(&state, &tx)?;
                         } else {
@@ -469,38 +490,82 @@ where
                         }
                     }
 
-                    ClientMsg::RenameChannel { channel, new_name } => {
-                        let old = normalize_channel(&channel);
+                    ClientMsg::RenameChannel { channel: id, new_name } => {
                         let new = normalize_channel(&new_name);
-                        if old.is_empty() || old.starts_with("dm-") || new.is_empty() || new.starts_with("dm-") {
+                        let current = state.lock().unwrap().db.channel_name(id)?;
+                        let renamable = matches!(&current, Some(name) if !name.starts_with("dm-"));
+                        if new.is_empty() || new.starts_with("dm-") || !renamable {
                             send(&mut writer, &ServerMsg::Error { text: "that channel cannot be renamed".into() }).await?;
                             continue;
                         }
-                        let renamed = state.lock().unwrap().db.rename_channel(&old, &new)?;
+                        let renamed = state.lock().unwrap().db.rename_channel(id, &new)?;
                         if renamed {
-                            let _ = tx.send(ServerMsg::ChannelRenamed { old, new });
+                            let _ = tx.send(ServerMsg::ChannelRenamed { id, name: new });
                             broadcast_categories(&state, &tx)?;
                         } else {
                             send(&mut writer, &ServerMsg::Error {
-                                text: "there is no such channel, or a channel with the new name already exists".into(),
+                                text: "a channel with the new name already exists".into(),
                             })
                             .await?;
                         }
                     }
 
-                    ClientMsg::MoveChannel { channel, category } => {
-                        let channel = normalize_channel(&channel);
-                        if channel.is_empty() || channel.starts_with("dm-") {
+                    ClientMsg::DeleteChannel { channel: id } => {
+                        let (owner, current) = {
+                            let s = state.lock().unwrap();
+                            (s.db.owner()?, s.db.channel_name(id)?)
+                        };
+                        if owner.as_deref() != Some(user.as_str()) {
+                            send(&mut writer, &ServerMsg::Error { text: "only the owner can delete channels".into() }).await?;
+                            continue;
+                        }
+                        let deletable = matches!(&current, Some(name) if !name.starts_with("dm-"));
+                        if !deletable {
+                            send(&mut writer, &ServerMsg::Error { text: "that channel cannot be deleted".into() }).await?;
+                            continue;
+                        }
+                        state.lock().unwrap().db.delete_channel(id)?;
+                        let _ = tx.send(ServerMsg::ChannelDeleted { id });
+                        broadcast_categories(&state, &tx)?;
+                    }
+
+                    ClientMsg::MoveCategory { category, before } => {
+                        let moved = state.lock().unwrap().db.move_category(category, before)?;
+                        if moved {
+                            broadcast_categories(&state, &tx)?;
+                        } else {
+                            send(&mut writer, &ServerMsg::Error { text: "that category cannot be moved there".into() }).await?;
+                        }
+                    }
+
+                    ClientMsg::PlaceChannel { channel: id, category, before } => {
+                        let current = state.lock().unwrap().db.channel_name(id)?;
+                        let movable = matches!(&current, Some(name) if !name.starts_with("dm-"));
+                        let category_ok = match category {
+                            Some(c) => state.lock().unwrap().db.category_exists(c)?,
+                            None => true,
+                        };
+                        if !movable || !category_ok {
+                            send(&mut writer, &ServerMsg::Error { text: "that channel cannot be moved there".into() }).await?;
+                            continue;
+                        }
+                        state.lock().unwrap().db.place_channel(id, category, before)?;
+                        broadcast_categories(&state, &tx)?;
+                    }
+
+                    ClientMsg::MoveChannel { channel: id, category } => {
+                        let current = state.lock().unwrap().db.channel_name(id)?;
+                        let movable = matches!(&current, Some(name) if !name.starts_with("dm-"));
+                        if !movable {
                             send(&mut writer, &ServerMsg::Error { text: "that channel cannot be moved".into() }).await?;
                             continue;
                         }
-                        let category = category.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
                         let moved = {
                             let s = state.lock().unwrap();
-                            match &category {
+                            match category {
                                 Some(c) if !s.db.category_exists(c)? => Err("there is no such category"),
                                 _ => {
-                                    s.db.move_channel(&channel, category.as_deref())?;
+                                    s.db.move_channel(id, category)?;
                                     Ok(())
                                 }
                             }
@@ -578,27 +643,34 @@ where
                             send(&mut writer, &ServerMsg::Error { text: "invalid channel name".into() }).await?;
                             continue;
                         }
-                        // Direct messages are joined only by their two members. Other names starting
-                        // with "dm-" are refused, so a normal channel can never take one.
-                        let history = {
-                            let s = state.lock().unwrap();
-                            if requested.starts_with("dm-") {
-                                if s.db.is_direct_message_member(&requested, &user)? {
-                                    Some(s.db.history(&requested)?)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                s.db.ensure_channel(&requested)?;
-                                Some(s.db.history(&requested)?)
+                        match join_channel(&state, &user, &requested)? {
+                            Some((id, history)) => {
+                                channel = requested.clone();
+                                channel_id = id;
+                                send(&mut writer, &ServerMsg::Joined { channel: ChannelRef { id, name: requested }, history }).await?;
                             }
-                        };
-                        let Some(history) = history else {
-                            send(&mut writer, &ServerMsg::Error { text: "that direct message is not yours".into() }).await?;
+                            None => {
+                                send(&mut writer, &ServerMsg::Error { text: "that direct message is not yours".into() }).await?;
+                            }
+                        }
+                    }
+
+                    ClientMsg::JoinChannel { id } => {
+                        let name = state.lock().unwrap().db.channel_name(id)?;
+                        let Some(name) = name else {
+                            send(&mut writer, &ServerMsg::Error { text: "there is no such channel".into() }).await?;
                             continue;
                         };
-                        channel = requested.clone();
-                        send(&mut writer, &ServerMsg::Joined { channel: requested, history }).await?;
+                        match join_channel(&state, &user, &name)? {
+                            Some((id, history)) => {
+                                channel = name.clone();
+                                channel_id = id;
+                                send(&mut writer, &ServerMsg::Joined { channel: ChannelRef { id, name }, history }).await?;
+                            }
+                            None => {
+                                send(&mut writer, &ServerMsg::Error { text: "that direct message is not yours".into() }).await?;
+                            }
+                        }
                     }
 
                     ClientMsg::Say { text } => {
@@ -615,6 +687,7 @@ where
                         }
                         let mut message = ChatMessage {
                             id: 0,
+                            channel_id,
                             channel: channel.clone(),
                             author: display.clone(),
                             author_id: user.clone(),
@@ -654,8 +727,8 @@ where
                         }
                         let result = state.lock().unwrap().db.toggle_reaction(id, &emoji, &user)?;
                         match result {
-                            Some((channel, reactions)) => {
-                                let _ = tx.send(ServerMsg::Reactions { channel, id, reactions });
+                            Some((channel_id, reactions)) => {
+                                let _ = tx.send(ServerMsg::Reactions { channel_id, id, reactions });
                             }
                             None => {
                                 send(&mut writer, &ServerMsg::Error { text: "that message no longer exists".into() }).await?;
@@ -674,8 +747,8 @@ where
                             s.db.delete_message(id, &user, is_owner)?
                         };
                         match deleted {
-                            Some(channel) => {
-                                let _ = tx.send(ServerMsg::MessageDeleted { channel, id });
+                            Some(channel_id) => {
+                                let _ = tx.send(ServerMsg::MessageDeleted { channel_id, id });
                             }
                             None => {
                                 send(&mut writer, &ServerMsg::Error {
@@ -703,8 +776,8 @@ where
                         }
                         let edited = state.lock().unwrap().db.edit_message(id, &user, &text)?;
                         match edited {
-                            Some(channel) => {
-                                let _ = tx.send(ServerMsg::MessageEdited { channel, id, text });
+                            Some(channel_id) => {
+                                let _ = tx.send(ServerMsg::MessageEdited { channel_id, id, text });
                             }
                             None => {
                                 send(&mut writer, &ServerMsg::Error {
@@ -720,7 +793,7 @@ where
             event = rx.recv() => {
                 match event {
                     Ok(ServerMsg::Message { message }) => {
-                        if message.channel == channel {
+                        if message.channel_id == channel_id {
                             send(&mut writer, &ServerMsg::Message { message }).await?;
                         } else {
                             // Tell the client there is unread activity, without the content. A
@@ -731,21 +804,21 @@ where
                                     || s.db.is_direct_message_member(&message.channel, &user)?
                             };
                             if allowed {
-                                send(&mut writer, &ServerMsg::Activity { channel: message.channel }).await?;
+                                send(&mut writer, &ServerMsg::Activity { channel_id: message.channel_id }).await?;
                             }
                         }
                     }
-                    Ok(ServerMsg::System { channel: c, text }) if c == channel => {
-                        send(&mut writer, &ServerMsg::System { channel: c, text }).await?;
+                    Ok(ServerMsg::System { channel_id: c, text }) if c == channel_id => {
+                        send(&mut writer, &ServerMsg::System { channel_id: c, text }).await?;
                     }
-                    Ok(ServerMsg::MessageEdited { channel: c, id, text }) if c == channel => {
-                        send(&mut writer, &ServerMsg::MessageEdited { channel: c, id, text }).await?;
+                    Ok(ServerMsg::MessageEdited { channel_id: c, id, text }) if c == channel_id => {
+                        send(&mut writer, &ServerMsg::MessageEdited { channel_id: c, id, text }).await?;
                     }
-                    Ok(ServerMsg::MessageDeleted { channel: c, id }) if c == channel => {
-                        send(&mut writer, &ServerMsg::MessageDeleted { channel: c, id }).await?;
+                    Ok(ServerMsg::MessageDeleted { channel_id: c, id }) if c == channel_id => {
+                        send(&mut writer, &ServerMsg::MessageDeleted { channel_id: c, id }).await?;
                     }
-                    Ok(ServerMsg::Reactions { channel: c, id, reactions }) if c == channel => {
-                        send(&mut writer, &ServerMsg::Reactions { channel: c, id, reactions }).await?;
+                    Ok(ServerMsg::Reactions { channel_id: c, id, reactions }) if c == channel_id => {
+                        send(&mut writer, &ServerMsg::Reactions { channel_id: c, id, reactions }).await?;
                     }
                     Ok(presence @ ServerMsg::Presence { .. }) => {
                         send(&mut writer, &presence).await?;
@@ -759,12 +832,21 @@ where
                     Ok(cats @ ServerMsg::Categories { .. }) => {
                         send(&mut writer, &cats).await?;
                     }
-                    Ok(ServerMsg::ChannelRenamed { old, new }) => {
-                        // A connection that was in the channel follows it to its new name.
-                        if channel == old {
-                            channel = new.clone();
+                    Ok(ServerMsg::ChannelDeleted { id }) => {
+                        // A connection that had the channel open moves to general.
+                        if channel_id == id {
+                            let general = state.lock().unwrap().db.ensure_channel("general")?;
+                            channel = "general".to_string();
+                            channel_id = general;
                         }
-                        send(&mut writer, &ServerMsg::ChannelRenamed { old, new }).await?;
+                        send(&mut writer, &ServerMsg::ChannelDeleted { id }).await?;
+                    }
+                    Ok(ServerMsg::ChannelRenamed { id, name }) => {
+                        // A connection that was in the channel follows it to its new name.
+                        if channel_id == id {
+                            channel = name.clone();
+                        }
+                        send(&mut writer, &ServerMsg::ChannelRenamed { id, name }).await?;
                     }
                     Ok(_) => {}
                     // Slow client fell behind; skip the dropped events and keep going.
@@ -776,7 +858,7 @@ where
     }
 
     let _ = tx.send(ServerMsg::System {
-        channel,
+        channel_id,
         text: format!("{user} disconnected"),
     });
     Ok(())
@@ -786,6 +868,7 @@ where
 fn public_info(state: &SharedState) -> ServerMsg {
     let s = state.lock().unwrap();
     ServerMsg::Info {
+        server_id: s.db.info_value("server_id").ok().flatten().unwrap_or_default(),
         name: s.db.server_name().unwrap_or_default(),
         description: s.db.server_description().unwrap_or_default(),
         icon: s.db.server_icon().ok().flatten(),
@@ -871,6 +954,7 @@ fn direct_message_list(state: &SharedState, user: &str) -> rusqlite::Result<Vec<
         .into_iter()
         .map(|(channel, other, last_message)| DirectMessage {
             name: names.get(&other).cloned().unwrap_or_else(|| other.clone()),
+            channel_id: s.db.ensure_channel(&channel).unwrap_or_default(),
             channel,
             last_message,
             other_id: other,
@@ -960,8 +1044,10 @@ async fn relay_receive(
         let s = state.lock().unwrap();
         s.db.add_person(&sender.id, &sender.name).map_err(|e| e.to_string())?;
         let channel = s.db.open_direct_message(&sender.id, to).map_err(|e| e.to_string())?;
+        let channel_id = s.db.ensure_channel(&channel).map_err(|e| e.to_string())?;
         let mut message = ChatMessage {
             id: 0,
+            channel_id,
             channel,
             author: sender.name.clone(),
             author_id: sender.id.clone(),
@@ -1116,10 +1202,31 @@ async fn send<W: AsyncWrite + Unpin>(writer: &mut W, msg: &ServerMsg) -> anyhow:
     Ok(())
 }
 
+/// Joins a channel by its name for this account. Returns the channel's id and its history, or `None`
+/// when the channel is a direct message the account is not a member of.
+fn join_channel(state: &SharedState, user: &str, name: &str) -> Result<Option<(i64, Vec<ChatMessage>)>, rusqlite::Error> {
+    // Direct messages are joined only by their two members. Other names starting with "dm-" are
+    // refused, so a normal channel can never take one.
+    let s = state.lock().unwrap();
+    let id = if name.starts_with("dm-") {
+        if !s.db.is_direct_message_member(name, user)? {
+            return Ok(None);
+        }
+        s.db.ensure_channel(name)?
+    } else {
+        s.db.ensure_channel(name)?
+    };
+    let history = s.db.history(id)?;
+    Ok(Some((id, history)))
+}
+
 /// Sends the current categories to every connection.
 fn broadcast_categories(state: &Arc<Mutex<State>>, tx: &broadcast::Sender<ServerMsg>) -> Result<(), rusqlite::Error> {
-    let categories = state.lock().unwrap().db.categories()?;
-    let _ = tx.send(ServerMsg::Categories { categories });
+    let (categories, uncategorized) = {
+        let s = state.lock().unwrap();
+        (s.db.categories()?, s.db.uncategorized_channels()?)
+    };
+    let _ = tx.send(ServerMsg::Categories { categories, uncategorized });
     Ok(())
 }
 
