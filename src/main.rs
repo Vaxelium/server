@@ -8,9 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::{
     ChannelRef,
-    AuthReply, AuthRequest, ChatMessage, ClientMsg, DirectMessage, ServerMsg, UserStatus, DEFAULT_ADDR,
+    AuthReply, AuthRequest, ChatMessage, ClientMsg, DirectMessage, RoleInfo, ServerMsg, UserStatus, DEFAULT_ADDR,
     DEFAULT_AUTH_ADDR,
-    DISCOVERY_PORT, MAX_SERVER_DESCRIPTION_LEN, MAX_SERVER_ICON_LEN,
+    DISCOVERY_PORT, EVERYONE_ROLE, MAX_ROLE_NAME_LEN, MAX_SERVER_DESCRIPTION_LEN, MAX_SERVER_ICON_LEN, perm,
 };
 use db::Db;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -46,6 +46,7 @@ impl State {
     fn presence(&self) -> Vec<UserStatus> {
         let owner = self.db.owner().ok().flatten();
         let names = self.db.display_names().unwrap_or_default();
+        let roles = self.db.all_member_roles().unwrap_or_default();
         self.db
             .member_names()
             .unwrap_or_default()
@@ -54,7 +55,8 @@ impl State {
                 let online = self.online.contains(&id);
                 let owner = owner.as_deref() == Some(id.as_str());
                 let name = names.get(&id).cloned().unwrap_or_else(|| id.clone());
-                UserStatus { id, name, online, owner }
+                let roles = roles.get(&id).cloned().unwrap_or_default();
+                UserStatus { id, name, online, owner, roles }
             })
             .collect()
     }
@@ -233,7 +235,6 @@ async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         let auth_addr = auth_addr.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            println!("connection from {peer}");
             let socket = match acceptor.accept(socket).await {
                 Ok(socket) => socket,
                 Err(e) => {
@@ -246,7 +247,6 @@ async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
                     eprintln!("{peer}: {e}");
                 }
             }
-            println!("{peer} disconnected");
         });
     }
 }
@@ -346,6 +346,8 @@ where
         server_public,
     };
     send(&mut writer, &welcome).await?;
+    let roles = state.lock().unwrap().db.role_list()?;
+    send(&mut writer, &ServerMsg::Roles { roles }).await?;
     {
         // Lets others message this account from another server. Does not hold up the welcome.
         let own = state.lock().unwrap().advertise.clone();
@@ -466,6 +468,10 @@ where
                     }
 
                     ClientMsg::CreateCategory { name } => {
+                        if !may(&state, &user, perm::MANAGE_CHANNELS)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_CHANNEL_PERMISSION.into() }).await?;
+                            continue;
+                        }
                         let name = name.trim().to_string();
                         if name.is_empty() || name.chars().count() > MAX_CATEGORY_NAME_LEN {
                             send(&mut writer, &ServerMsg::Error {
@@ -483,6 +489,10 @@ where
                     }
 
                     ClientMsg::DeleteCategory { category } => {
+                        if !may(&state, &user, perm::MANAGE_CHANNELS)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_CHANNEL_PERMISSION.into() }).await?;
+                            continue;
+                        }
                         let removed = state.lock().unwrap().db.delete_category(category)?;
                         if removed {
                             broadcast_categories(&state, &tx)?;
@@ -492,6 +502,10 @@ where
                     }
 
                     ClientMsg::RenameChannel { channel: id, new_name } => {
+                        if !may(&state, &user, perm::MANAGE_CHANNELS)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_CHANNEL_PERMISSION.into() }).await?;
+                            continue;
+                        }
                         let new = normalize_channel(&new_name);
                         let current = state.lock().unwrap().db.channel_name(id)?;
                         let renamable = matches!(&current, Some(name) if !name.starts_with("dm-"));
@@ -512,14 +526,11 @@ where
                     }
 
                     ClientMsg::DeleteChannel { channel: id } => {
-                        let (owner, current) = {
-                            let s = state.lock().unwrap();
-                            (s.db.owner()?, s.db.channel_name(id)?)
-                        };
-                        if owner.as_deref() != Some(user.as_str()) {
-                            send(&mut writer, &ServerMsg::Error { text: "only the owner can delete channels".into() }).await?;
+                        if !may(&state, &user, perm::MANAGE_CHANNELS)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_CHANNEL_PERMISSION.into() }).await?;
                             continue;
                         }
+                        let current = state.lock().unwrap().db.channel_name(id)?;
                         let deletable = matches!(&current, Some(name) if !name.starts_with("dm-"));
                         if !deletable {
                             send(&mut writer, &ServerMsg::Error { text: "that channel cannot be deleted".into() }).await?;
@@ -531,6 +542,10 @@ where
                     }
 
                     ClientMsg::MoveCategory { category, before } => {
+                        if !may(&state, &user, perm::MANAGE_CHANNELS)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_CHANNEL_PERMISSION.into() }).await?;
+                            continue;
+                        }
                         let moved = state.lock().unwrap().db.move_category(category, before)?;
                         if moved {
                             broadcast_categories(&state, &tx)?;
@@ -540,6 +555,10 @@ where
                     }
 
                     ClientMsg::PlaceChannel { channel: id, category, before } => {
+                        if !may(&state, &user, perm::MANAGE_CHANNELS)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_CHANNEL_PERMISSION.into() }).await?;
+                            continue;
+                        }
                         let current = state.lock().unwrap().db.channel_name(id)?;
                         let movable = matches!(&current, Some(name) if !name.starts_with("dm-"));
                         let category_ok = match category {
@@ -555,6 +574,10 @@ where
                     }
 
                     ClientMsg::MoveChannel { channel: id, category } => {
+                        if !may(&state, &user, perm::MANAGE_CHANNELS)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_CHANNEL_PERMISSION.into() }).await?;
+                            continue;
+                        }
                         let current = state.lock().unwrap().db.channel_name(id)?;
                         let movable = matches!(&current, Some(name) if !name.starts_with("dm-"));
                         if !movable {
@@ -574,6 +597,40 @@ where
                         match moved {
                             Ok(()) => broadcast_categories(&state, &tx)?,
                             Err(text) => send(&mut writer, &ServerMsg::Error { text: text.into() }).await?,
+                        }
+                    }
+
+                    ClientMsg::CreateRole { name, color, permissions } => {
+                        let change = RoleChange::Create { name, color, permissions };
+                        if let Some(text) = change_roles(&state, &tx, &user, change)? {
+                            send(&mut writer, &ServerMsg::Error { text }).await?;
+                        }
+                    }
+
+                    ClientMsg::UpdateRole { role, name, color, permissions } => {
+                        let change = RoleChange::Update { role, name, color, permissions };
+                        if let Some(text) = change_roles(&state, &tx, &user, change)? {
+                            send(&mut writer, &ServerMsg::Error { text }).await?;
+                        }
+                    }
+
+                    ClientMsg::DeleteRole { role } => {
+                        if let Some(text) = change_roles(&state, &tx, &user, RoleChange::Delete { role })? {
+                            send(&mut writer, &ServerMsg::Error { text }).await?;
+                        }
+                    }
+
+                    ClientMsg::MoveRole { role, before } => {
+                        let change = RoleChange::Move { role, before };
+                        if let Some(text) = change_roles(&state, &tx, &user, change)? {
+                            send(&mut writer, &ServerMsg::Error { text }).await?;
+                        }
+                    }
+
+                    ClientMsg::SetMemberRole { user: member, role, on } => {
+                        let change = RoleChange::Member { user: member, role, on };
+                        if let Some(text) = change_roles(&state, &tx, &user, change)? {
+                            send(&mut writer, &ServerMsg::Error { text }).await?;
                         }
                     }
 
@@ -642,6 +699,15 @@ where
                         let requested = normalize_channel(&requested);
                         if requested.is_empty() {
                             send(&mut writer, &ServerMsg::Error { text: "invalid channel name".into() }).await?;
+                            continue;
+                        }
+                        // Joining a channel that does not exist yet creates it, so that needs Manage channels.
+                        let exists = state.lock().unwrap().db.channel_id(&requested)?.is_some();
+                        if !exists && !requested.starts_with("dm-") && !may(&state, &user, perm::MANAGE_CHANNELS)? {
+                            send(&mut writer, &ServerMsg::Error {
+                                text: "you need the Manage channels permission to create a channel".into(),
+                            })
+                            .await?;
                             continue;
                         }
                         match join_channel(&state, &user, &requested)? {
@@ -745,19 +811,16 @@ where
                             send(&mut writer, &ServerMsg::Error { text: CROSS_SERVER_CHANGES.into() }).await?;
                             continue;
                         }
-                        // The author may delete a message, and so may the server owner.
-                        let deleted = {
-                            let s = state.lock().unwrap();
-                            let is_owner = s.db.owner()?.as_deref() == Some(user.as_str());
-                            s.db.delete_message(id, &user, is_owner)?
-                        };
+                        // The author may delete a message, and so may anyone with Manage messages.
+                        let any = may(&state, &user, perm::MANAGE_MESSAGES)?;
+                        let deleted = state.lock().unwrap().db.delete_message(id, &user, any)?;
                         match deleted {
                             Some(channel_id) => {
                                 let _ = tx.send(ServerMsg::MessageDeleted { channel_id, id });
                             }
                             None => {
                                 send(&mut writer, &ServerMsg::Error {
-                                    text: "only the author or the server owner can delete a message".into(),
+                                    text: "only the author, or someone with Manage messages, can delete a message".into(),
                                 })
                                 .await?;
                             }
@@ -827,6 +890,9 @@ where
                     }
                     Ok(presence @ ServerMsg::Presence { .. }) => {
                         send(&mut writer, &presence).await?;
+                    }
+                    Ok(roles @ ServerMsg::Roles { .. }) => {
+                        send(&mut writer, &roles).await?;
                     }
                     Ok(icon @ ServerMsg::ServerIcon { .. }) => {
                         send(&mut writer, &icon).await?;
@@ -1224,6 +1290,208 @@ fn join_channel(state: &SharedState, user: &str, name: &str) -> Result<Option<(i
     Ok(Some((id, history)))
 }
 
+const NO_CHANNEL_PERMISSION: &str = "you need the Manage channels permission for that";
+
+/// What an account may do, worked out from its roles.
+struct Power {
+    owner: bool,
+    /// The permissions its roles grant together.
+    perms: u32,
+    /// Where its highest role sits in the role order (highest first), if it has any roles.
+    top: Option<usize>,
+}
+
+impl Power {
+    fn has(&self, permission: u32) -> bool {
+        self.owner || self.perms & permission == permission
+    }
+
+    /// True when the account is above the role at `index` in the role order, so it may manage it.
+    fn outranks(&self, index: usize) -> bool {
+        self.owner || self.top.is_some_and(|top| index > top)
+    }
+}
+
+/// Works out what `user` may do. `order` is every role, highest first.
+fn power_of(db: &Db, user: &str, order: &[RoleInfo]) -> rusqlite::Result<Power> {
+    if db.owner()?.as_deref() == Some(user) {
+        return Ok(Power { owner: true, perms: perm::ALL, top: None });
+    }
+    let mine = db.member_role_ids(user)?;
+    // Everyone has @everyone, so its permissions apply first. It never counts as a member's highest role.
+    let mut perms = order.iter().find(|r| r.id == EVERYONE_ROLE).map_or(0, |r| r.permissions);
+    let mut top = None;
+    for (index, role) in order.iter().enumerate() {
+        if role.id != EVERYONE_ROLE && mine.contains(&role.id) {
+            perms |= role.permissions;
+            top.get_or_insert(index);
+        }
+    }
+    Ok(Power { owner: false, perms, top })
+}
+
+/// True when `user` has the permission. The owner has every permission.
+fn may(state: &SharedState, user: &str, permission: u32) -> rusqlite::Result<bool> {
+    let s = state.lock().unwrap();
+    let order = s.db.role_list()?;
+    Ok(power_of(&s.db, user, &order)?.has(permission))
+}
+
+/// A change to the roles, asked for by a member.
+enum RoleChange {
+    Create { name: String, color: String, permissions: u32 },
+    Update { role: i64, name: String, color: String, permissions: u32 },
+    Delete { role: i64 },
+    Move { role: i64, before: Option<i64> },
+    Member { user: String, role: i64, on: bool },
+}
+
+/// Why a role's name, colour or permissions are not allowed, or `None` when they are fine.
+fn role_fields_error(power: &Power, name: &str, color: &str, permissions: u32) -> Option<String> {
+    if name.is_empty() || name.chars().count() > MAX_ROLE_NAME_LEN {
+        return Some(format!("role name must be 1-{MAX_ROLE_NAME_LEN} characters"));
+    }
+    let color_ok = color.is_empty()
+        || (color.len() == 7 && color.starts_with('#') && color[1..].bytes().all(|b| b.is_ascii_hexdigit()));
+    if !color_ok {
+        return Some("colour must look like #rrggbb".into());
+    }
+    if permissions & !perm::ALL != 0 {
+        return Some("that permission does not exist".into());
+    }
+    if permissions & !power.perms != 0 {
+        return Some("you cannot give a role permissions you do not have".into());
+    }
+    None
+}
+
+/// Applies a role change for `actor`. `Ok(Err(text))` means it was refused, and why.
+fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Result<Result<(), String>> {
+    let order = db.role_list()?;
+    let power = power_of(db, actor, &order)?;
+    if !power.has(perm::MANAGE_ROLES) {
+        return Ok(Err("you need the Manage roles permission for that".into()));
+    }
+    let index_of = |id: i64| order.iter().position(|r| r.id == id);
+    let below_you = "that role is not below your highest role";
+    let no_role = "there is no such role";
+    match change {
+        RoleChange::Create { name, color, permissions } => {
+            let name = name.trim().to_string();
+            if let Some(text) = role_fields_error(&power, &name, &color, permissions) {
+                return Ok(Err(text));
+            }
+            match db.create_role(&name, &color, permissions)? {
+                Some(_) => Ok(Ok(())),
+                None => Ok(Err("a role with that name already exists".into())),
+            }
+        }
+        RoleChange::Update { role, name, color, permissions } => {
+            // @everyone keeps its name.
+            let name = if role == EVERYONE_ROLE { "@everyone".to_string() } else { name.trim().to_string() };
+            let Some(index) = index_of(role) else { return Ok(Err(no_role.into())) };
+            if !power.outranks(index) {
+                return Ok(Err(below_you.into()));
+            }
+            if let Some(text) = role_fields_error(&power, &name, &color, permissions) {
+                return Ok(Err(text));
+            }
+            if db.role_name_taken(&name, role)? {
+                return Ok(Err("a role with that name already exists".into()));
+            }
+            db.update_role(role, &name, &color, permissions)?;
+            Ok(Ok(()))
+        }
+        RoleChange::Delete { role } => {
+            if role == EVERYONE_ROLE {
+                return Ok(Err("@everyone cannot be deleted".into()));
+            }
+            let Some(index) = index_of(role) else { return Ok(Err(no_role.into())) };
+            if !power.outranks(index) {
+                return Ok(Err(below_you.into()));
+            }
+            db.delete_role(role)?;
+            Ok(Ok(()))
+        }
+        RoleChange::Move { role, before } => {
+            if role == EVERYONE_ROLE {
+                return Ok(Err("@everyone stays at the bottom".into()));
+            }
+            let Some(index) = index_of(role) else { return Ok(Err(no_role.into())) };
+            if !power.outranks(index) {
+                return Ok(Err(below_you.into()));
+            }
+            // Only the real roles are reordered; @everyone stays at the bottom.
+            let mut ids: Vec<i64> = order.iter().map(|r| r.id).filter(|&id| id != EVERYONE_ROLE).collect();
+            ids.retain(|&id| id != role);
+            let at = match before {
+                Some(b) => match ids.iter().position(|&id| id == b) {
+                    Some(at) => at,
+                    None => return Ok(Err(no_role.into())),
+                },
+                None => ids.len(),
+            };
+            ids.insert(at, role);
+            // The role must still sit below the sender's highest role after the move.
+            if !power.owner {
+                let top_id = power.top.map(|t| order[t].id);
+                let moved_at = ids.iter().position(|&id| id == role);
+                let top_at = top_id.and_then(|t| ids.iter().position(|&id| id == t));
+                if !matches!((moved_at, top_at), (Some(m), Some(t)) if m > t) {
+                    return Ok(Err(below_you.into()));
+                }
+            }
+            db.set_role_order(&ids)?;
+            Ok(Ok(()))
+        }
+        RoleChange::Member { user, role, on } => {
+            if role == EVERYONE_ROLE {
+                return Ok(Err("@everyone is given to everyone automatically".into()));
+            }
+            let Some(index) = index_of(role) else { return Ok(Err(no_role.into())) };
+            if !power.outranks(index) {
+                return Ok(Err(below_you.into()));
+            }
+            if !db.is_member(&user)? {
+                return Ok(Err("that person is not a member of this server".into()));
+            }
+            let target = power_of(db, &user, &order)?;
+            // The owner outranks every role, so only the owner may change the owner's roles.
+            if target.owner && !power.owner {
+                return Ok(Err("only the owner can change the owner's roles".into()));
+            }
+            if !target.top.map_or(true, |top| power.outranks(top)) {
+                return Ok(Err("that member's highest role is not below yours".into()));
+            }
+            db.set_member_role(&user, role, on)?;
+            Ok(Ok(()))
+        }
+    }
+}
+
+/// Applies a role change and tells everyone about the new roles and members. Returns why the change
+/// was refused, if it was.
+fn change_roles(
+    state: &SharedState,
+    tx: &broadcast::Sender<ServerMsg>,
+    user: &str,
+    change: RoleChange,
+) -> rusqlite::Result<Option<String>> {
+    let outcome = apply_role_change(&state.lock().unwrap().db, user, change)?;
+    match outcome {
+        Ok(()) => {
+            let (roles, users) = {
+                let s = state.lock().unwrap();
+                (s.db.role_list()?, s.presence())
+            };
+            let _ = tx.send(ServerMsg::Roles { roles });
+            let _ = tx.send(ServerMsg::Presence { users });
+            Ok(None)
+        }
+        Err(text) => Ok(Some(text)),
+    }
+}
+
 /// Sends the current categories to every connection.
 fn broadcast_categories(state: &Arc<Mutex<State>>, tx: &broadcast::Sender<ServerMsg>) -> Result<(), rusqlite::Error> {
     let (categories, uncategorized) = {
@@ -1249,4 +1517,226 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+
+    /// The owner, then "bob" who has the Admin role (manage roles and channels) and "carol" who has none.
+    fn server() -> (Db, i64, i64) {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("bob", "Bob", 2).unwrap();
+        db.add_member("carol", "Carol", 3).unwrap();
+        db.add_member("dan", "Dan", 4).unwrap();
+        let admin = db
+            .create_role("Admin", "", perm::MANAGE_ROLES | perm::MANAGE_CHANNELS)
+            .unwrap()
+            .unwrap();
+        let mods = db.create_role("Mods", "#00ff00", perm::MANAGE_MESSAGES).unwrap().unwrap();
+        // Admin sits above Mods, as it does after creation order: Mods was created last, so is lowest.
+        db.set_role_order(&[admin, mods]).unwrap();
+        db.set_member_role("bob", admin, true).unwrap();
+        db.set_member_role("dan", admin, true).unwrap();
+        (db, admin, mods)
+    }
+
+    #[test]
+    fn owner_can_do_everything() {
+        let (db, _, _) = server();
+        let made = apply_role_change(
+            &db,
+            "owner",
+            RoleChange::Create { name: "Helpers".into(), color: "#123456".into(), permissions: perm::ALL },
+        )
+        .unwrap();
+        assert_eq!(made, Ok(()));
+        assert!(db.role_list().unwrap().iter().any(|r| r.name == "Helpers"));
+    }
+
+    #[test]
+    fn members_without_manage_roles_cannot_change_roles() {
+        let (db, _, mods) = server();
+        let refused = apply_role_change(
+            &db,
+            "carol",
+            RoleChange::Member { user: "carol".into(), role: mods, on: true },
+        )
+        .unwrap();
+        assert!(refused.is_err());
+        let refused = apply_role_change(
+            &db,
+            "carol",
+            RoleChange::Create { name: "X".into(), color: String::new(), permissions: 0 },
+        )
+        .unwrap();
+        assert!(refused.is_err());
+    }
+
+    #[test]
+    fn admins_give_roles_below_them_only() {
+        let (db, admin, mods) = server();
+        let given = apply_role_change(
+            &db,
+            "bob",
+            RoleChange::Member { user: "carol".into(), role: mods, on: true },
+        )
+        .unwrap();
+        assert_eq!(given, Ok(()));
+        assert_eq!(db.member_role_ids("carol").unwrap(), vec![mods]);
+
+        // Admin is not below bob's own highest role, so bob cannot give it.
+        let refused = apply_role_change(
+            &db,
+            "bob",
+            RoleChange::Member { user: "carol".into(), role: admin, on: true },
+        )
+        .unwrap();
+        assert!(refused.is_err());
+        // Dan has the same highest role as bob, so bob cannot change his roles.
+        let refused = apply_role_change(
+            &db,
+            "bob",
+            RoleChange::Member { user: "dan".into(), role: mods, on: false },
+        )
+        .unwrap();
+        assert!(refused.is_err());
+    }
+
+    #[test]
+    fn admins_cannot_give_permissions_they_lack() {
+        let (db, _, _) = server();
+        let refused = apply_role_change(
+            &db,
+            "bob",
+            RoleChange::Create { name: "Owners".into(), color: String::new(), permissions: perm::ALL },
+        )
+        .unwrap();
+        // Bob has MANAGE_ROLES and MANAGE_CHANNELS, not MANAGE_MESSAGES.
+        assert!(refused.is_err());
+        let fine = apply_role_change(
+            &db,
+            "bob",
+            RoleChange::Create { name: "Cleaners".into(), color: String::new(), permissions: perm::MANAGE_CHANNELS },
+        )
+        .unwrap();
+        assert_eq!(fine, Ok(()));
+    }
+
+    #[test]
+    fn roles_are_checked_for_names_and_colours() {
+        let (db, _, mods) = server();
+        let taken = apply_role_change(
+            &db,
+            "owner",
+            RoleChange::Create { name: "Mods".into(), color: String::new(), permissions: 0 },
+        )
+        .unwrap();
+        assert!(taken.is_err());
+        let bad_colour = apply_role_change(
+            &db,
+            "owner",
+            RoleChange::Update { role: mods, name: "Mods".into(), color: "red".into(), permissions: 0 },
+        )
+        .unwrap();
+        assert!(bad_colour.is_err());
+    }
+
+    #[test]
+    fn deleting_a_role_takes_it_from_members() {
+        let (db, _, mods) = server();
+        apply_role_change(&db, "owner", RoleChange::Member { user: "carol".into(), role: mods, on: true })
+            .unwrap()
+            .unwrap();
+        apply_role_change(&db, "owner", RoleChange::Delete { role: mods }).unwrap().unwrap();
+        assert!(db.member_role_ids("carol").unwrap().is_empty());
+        assert!(db.role_list().unwrap().iter().all(|r| r.id != mods));
+    }
+
+    #[test]
+    fn admins_cannot_move_roles_above_their_own() {
+        let (db, admin, mods) = server();
+        // Bob tries to move Mods above Admin, which would put it above his own role.
+        let refused = apply_role_change(&db, "bob", RoleChange::Move { role: mods, before: Some(admin) }).unwrap();
+        assert!(refused.is_err());
+        // Bob cannot move Admin at all: it is his own highest role.
+        let refused = apply_role_change(&db, "bob", RoleChange::Move { role: admin, before: None }).unwrap();
+        assert!(refused.is_err());
+        // The owner can.
+        let moved = apply_role_change(&db, "owner", RoleChange::Move { role: admin, before: None }).unwrap();
+        assert_eq!(moved, Ok(()));
+        let order: Vec<i64> = db.role_list().unwrap().iter().map(|r| r.id).filter(|&id| id != EVERYONE_ROLE).collect();
+        assert_eq!(order, vec![mods, admin]);
+    }
+
+    #[test]
+    fn only_the_owner_changes_the_owners_roles() {
+        let (db, admin, mods) = server();
+        // Bob outranks Mods, but the owner outranks everyone, so he may not change the owner's roles.
+        let refused = apply_role_change(
+            &db,
+            "bob",
+            RoleChange::Member { user: "owner".into(), role: mods, on: true },
+        )
+        .unwrap();
+        assert!(refused.is_err());
+        // The owner may give themselves a role, and it shows on the owner.
+        let given = apply_role_change(
+            &db,
+            "owner",
+            RoleChange::Member { user: "owner".into(), role: admin, on: true },
+        )
+        .unwrap();
+        assert_eq!(given, Ok(()));
+        assert_eq!(db.member_role_ids("owner").unwrap(), vec![admin]);
+    }
+}
+
+#[cfg(test)]
+mod everyone_tests {
+    use super::*;
+
+    fn server() -> Db {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("carol", "Carol", 2).unwrap();
+        db
+    }
+
+    #[test]
+    fn everyone_is_listed_last_and_cannot_be_deleted_moved_or_given() {
+        let db = server();
+        let order = db.role_list().unwrap();
+        assert_eq!(order.last().map(|r| r.id), Some(EVERYONE_ROLE));
+        let mods = db.create_role("Mods", "", 0).unwrap().unwrap();
+        assert_eq!(db.role_list().unwrap().last().map(|r| r.id), Some(EVERYONE_ROLE), "new roles go above @everyone");
+        assert!(apply_role_change(&db, "owner", RoleChange::Delete { role: EVERYONE_ROLE }).unwrap().is_err());
+        assert!(apply_role_change(&db, "owner", RoleChange::Move { role: EVERYONE_ROLE, before: None }).unwrap().is_err());
+        assert!(apply_role_change(&db, "owner", RoleChange::Member { user: "carol".into(), role: EVERYONE_ROLE, on: true }).unwrap().is_err());
+        // Reordering the real roles leaves @everyone at the bottom.
+        apply_role_change(&db, "owner", RoleChange::Move { role: mods, before: None }).unwrap().unwrap();
+        assert_eq!(db.role_list().unwrap().last().map(|r| r.id), Some(EVERYONE_ROLE));
+    }
+
+    #[test]
+    fn everyone_permissions_apply_to_every_member() {
+        let db = server();
+        let given = apply_role_change(
+            &db,
+            "owner",
+            RoleChange::Update { role: EVERYONE_ROLE, name: "x".into(), color: "#112233".into(), permissions: perm::MANAGE_MESSAGES },
+        )
+        .unwrap();
+        assert_eq!(given, Ok(()));
+        let everyone = db.role_list().unwrap().into_iter().find(|r| r.id == EVERYONE_ROLE).unwrap();
+        assert_eq!(everyone.name, "@everyone", "its name is fixed");
+        assert_eq!(everyone.color, "#112233");
+        let order = db.role_list().unwrap();
+        // Carol has no roles at all, but still holds @everyone's permissions.
+        let carol = power_of(&db, "carol", &order).unwrap();
+        assert!(carol.has(perm::MANAGE_MESSAGES));
+        assert!(!carol.has(perm::MANAGE_CHANNELS));
+        assert!(carol.top.is_none());
+    }
 }
