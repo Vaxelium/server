@@ -16,7 +16,7 @@ use tokio::time::{interval, timeout};
 
 use crate::{pin_ok, SharedState};
 
-const BEACON_PREFIX: &str = "DISSCORD ";
+const BEACON_PREFIX: &str = "VAXELIUM ";
 const BEACON_EVERY: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_FAILURES: u32 = 3;
