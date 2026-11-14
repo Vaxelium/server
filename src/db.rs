@@ -55,6 +55,18 @@ CREATE TABLE IF NOT EXISTS people (
     id      TEXT PRIMARY KEY,
     display TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS roles (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    color       TEXT NOT NULL DEFAULT '',
+    permissions INTEGER NOT NULL DEFAULT 0,
+    position    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS member_roles (
+    user_id TEXT NOT NULL,
+    role_id INTEGER NOT NULL,
+    PRIMARY KEY (user_id, role_id)
+);
 CREATE TABLE IF NOT EXISTS direct_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     a  TEXT NOT NULL,
@@ -131,6 +143,11 @@ impl Db {
             }
         }
         conn.execute_batch(SCHEMA)?;
+        // The @everyone role: held by every member, always at the bottom of the hierarchy.
+        conn.execute(
+            "INSERT OR IGNORE INTO roles (id, name, color, permissions, position) VALUES (0, '@everyone', '', 0, -1000000000)",
+            [],
+        )?;
         migrate_to_ids(&conn)?;
         // Direct messages made before cross-server ones lack this column; they are all local.
         let _ = conn.execute("ALTER TABLE direct_messages ADD COLUMN cross INTEGER NOT NULL DEFAULT 0", []);
@@ -749,6 +766,109 @@ impl Db {
     }
 
     /// Saves a message and returns its new id.
+    /// Every role, highest first.
+    pub fn role_list(&self) -> rusqlite::Result<Vec<common::RoleInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, color, permissions, position FROM roles ORDER BY position DESC, id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(common::RoleInfo {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                color: row.get(2)?,
+                permissions: row.get::<_, i64>(3)? as u32,
+                position: row.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Adds a role at the bottom of the hierarchy. Returns its id, or `None` when the name is taken.
+    pub fn create_role(&self, name: &str, color: &str, permissions: u32) -> rusqlite::Result<Option<i64>> {
+        // Above @everyone, which sits at the very bottom.
+        let position: i64 = self.conn.query_row(
+            "SELECT COALESCE(MIN(position), 1) - 1 FROM roles WHERE id != 0",
+            [],
+            |row| row.get(0),
+        )?;
+        let added = self.conn.execute(
+            "INSERT OR IGNORE INTO roles (name, color, permissions, position) VALUES (?1, ?2, ?3, ?4)",
+            params![name, color, permissions as i64, position],
+        )?;
+        Ok((added > 0).then(|| self.conn.last_insert_rowid()))
+    }
+
+    /// True when another role (not `except`) already has this name.
+    pub fn role_name_taken(&self, name: &str, except: i64) -> rusqlite::Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM roles WHERE name = ?1 AND id != ?2",
+            params![name, except],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Changes a role's name, colour and permissions. Returns false when there is no such role.
+    pub fn update_role(&self, id: i64, name: &str, color: &str, permissions: u32) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE roles SET name = ?2, color = ?3, permissions = ?4 WHERE id = ?1",
+            params![id, name, color, permissions as i64],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Removes a role and takes it from everyone who had it. Returns false when there is no such role.
+    pub fn delete_role(&self, id: i64) -> rusqlite::Result<bool> {
+        self.conn.execute("DELETE FROM member_roles WHERE role_id = ?1", params![id])?;
+        Ok(self.conn.execute("DELETE FROM roles WHERE id = ?1", params![id])? > 0)
+    }
+
+    /// Sets the order of the roles, highest first. Every role must be in `order`.
+    pub fn set_role_order(&self, order: &[i64]) -> rusqlite::Result<()> {
+        for (index, id) in order.iter().enumerate() {
+            self.conn.execute(
+                "UPDATE roles SET position = ?2 WHERE id = ?1",
+                params![id, (order.len() - index) as i64],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Gives a member a role, or takes it away.
+    pub fn set_member_role(&self, user: &str, role: i64, on: bool) -> rusqlite::Result<()> {
+        if on {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO member_roles (user_id, role_id) VALUES (?1, ?2)",
+                params![user, role],
+            )?;
+        } else {
+            self.conn.execute(
+                "DELETE FROM member_roles WHERE user_id = ?1 AND role_id = ?2",
+                params![user, role],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The ids of the roles a member has.
+    pub fn member_role_ids(&self, user: &str) -> rusqlite::Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare("SELECT role_id FROM member_roles WHERE user_id = ?1")?;
+        let ids = stmt.query_map(params![user], |row| row.get(0))?;
+        ids.collect()
+    }
+
+    /// The role ids of every member who has any role, by member id.
+    pub fn all_member_roles(&self) -> rusqlite::Result<std::collections::HashMap<String, Vec<i64>>> {
+        let mut stmt = self.conn.prepare("SELECT user_id, role_id FROM member_roles")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        let mut map: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
+        for row in rows {
+            let (user, role) = row?;
+            map.entry(user).or_default().push(role);
+        }
+        Ok(map)
+    }
+
     pub fn save_message(&self, m: &ChatMessage) -> rusqlite::Result<i64> {
         self.conn.execute(
             "INSERT INTO messages (channel, channel_id, author, text, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
