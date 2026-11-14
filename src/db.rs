@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS messages (
     edited    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS messages_by_channel ON messages (channel, id);
+CREATE TABLE IF NOT EXISTS people (
+    id      TEXT PRIMARY KEY,
+    display TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS direct_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     a  TEXT NOT NULL,
@@ -59,6 +63,8 @@ impl Db {
     pub fn open(path: &str) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        // Direct messages made before cross-server ones lack this column; they are all local.
+        let _ = conn.execute("ALTER TABLE direct_messages ADD COLUMN cross INTEGER NOT NULL DEFAULT 0", []);
         // Databases made before messages could be edited lack this column.
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0", []);
         // Members get a display name separate from their id. Older databases lack it.
@@ -134,18 +140,72 @@ impl Db {
 
     /// The name to show for each member, by id.
     pub fn display_names(&self) -> rusqlite::Result<std::collections::HashMap<String, String>> {
-        let mut stmt = self.conn.prepare("SELECT name, COALESCE(display, name) FROM members")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT name, COALESCE(display, name) FROM members
+             UNION
+             SELECT id, display FROM people WHERE id NOT IN (SELECT name FROM members)",
+        )?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
         rows.collect()
     }
 
     /// The owner of this server, by id, if anyone has joined it yet.
-    /// The direct message channel between two members, created the first time.
+    /// Remembers the display name of someone who is not a member of this server, such as the
+    /// sender of a direct message relayed from another server.
+    pub fn add_person(&self, id: &str, display: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO people (id, display) VALUES (?1, ?2)
+             ON CONFLICT (id) DO UPDATE SET display = excluded.display",
+            params![id, display],
+        )?;
+        Ok(())
+    }
+
+    /// Whether this server has a member with this account id.
+    pub fn is_member(&self, id: &str) -> rusqlite::Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM members WHERE name = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// The two members of a direct message channel, if it is one.
+    pub fn direct_message_pair(&self, channel: &str) -> rusqlite::Result<Option<(String, String)>> {
+        use rusqlite::OptionalExtension;
+        let Some(id) = channel.strip_prefix("dm-").and_then(|n| n.parse::<i64>().ok()) else {
+            return Ok(None);
+        };
+        self.conn
+            .query_row("SELECT a, b FROM direct_messages WHERE id = ?1", params![id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()
+    }
+
+    /// Whether a direct message has a member who is not on this server. Such a conversation is
+    /// kept in step with the other server, so it cannot be edited, deleted or reacted to.
+    pub fn is_cross_server_dm(&self, channel: &str) -> rusqlite::Result<bool> {
+        let Some(id) = channel.strip_prefix("dm-").and_then(|n| n.parse::<i64>().ok()) else {
+            return Ok(false);
+        };
+        let cross: i64 = self.conn.query_row(
+            "SELECT cross FROM direct_messages WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        Ok(cross != 0)
+    }
+
+    /// The direct message channel between two members, created the first time. A conversation
+    /// with someone who is not a member of this server is marked as cross-server.
     pub fn open_direct_message(&self, a: &str, b: &str) -> rusqlite::Result<String> {
         let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let cross = !(self.is_member(lo)? && self.is_member(hi)?);
         self.conn.execute(
-            "INSERT OR IGNORE INTO direct_messages (a, b) VALUES (?1, ?2)",
-            params![lo, hi],
+            "INSERT OR IGNORE INTO direct_messages (a, b, cross) VALUES (?1, ?2, ?3)",
+            params![lo, hi, cross as i64],
         )?;
         let id: i64 = self.conn.query_row(
             "SELECT id FROM direct_messages WHERE a = ?1 AND b = ?2",

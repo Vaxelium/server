@@ -276,6 +276,12 @@ where
             send(&mut writer, &ServerMsg::Peers { addrs }).await?;
             return Ok(());
         }
+        // Another server passing on a direct message from one of its members.
+        Ok(ClientMsg::RelayDm { token, to, text }) => {
+            let error = relay_receive(&state, &auth_addr, &tx, &token, &to, &text).await.err();
+            send(&mut writer, &ServerMsg::RelayAck { error }).await?;
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -320,6 +326,14 @@ where
         server_public,
     };
     send(&mut writer, &welcome).await?;
+    {
+        // Lets others message this account from another server. Does not hold up the welcome.
+        let own = state.lock().unwrap().advertise.clone();
+        let (state2, auth2, token2) = (state.clone(), auth_addr.to_string(), session_token.clone());
+        tokio::spawn(async move {
+            let _ = auth_call(&state2, &auth2, &AuthRequest::Seen { token: token2, addr: own }).await;
+        });
+    }
     send(&mut writer, &ServerMsg::DirectMessages { list: direct_message_list(&state, &user)? }).await?;
     let _ = tx.send(ServerMsg::Presence { users });
     let _ = tx.send(ServerMsg::System {
@@ -340,6 +354,9 @@ where
                 };
 
                 match msg {
+                    ClientMsg::RelayDm { .. } => {
+                        send(&mut writer, &ServerMsg::Error { text: "that message is only accepted from another server".into() }).await?;
+                    }
                     ClientMsg::Connect { .. } => {
                         send(&mut writer, &ServerMsg::Error { text: "already logged in".into() }).await?;
                     }
@@ -359,12 +376,28 @@ where
                     }
 
                     ClientMsg::OpenDm { name } => {
-                        let opened = {
-                            let s = state.lock().unwrap();
-                            match s.db.member_by_display_name(&name)? {
-                                None => Err("there is no member with that name".to_string()),
-                                Some(other) if other == user => Err("you cannot message yourself".to_string()),
-                                Some(other) => {
+                        // A member of this server, or else an account found through the auth service.
+                        let local = state.lock().unwrap().db.member_by_display_name(&name)?;
+                        let other = match local {
+                            Some(id) => Ok(id),
+                            None => match auth_call(&state, &auth_addr, &AuthRequest::Lookup { name: name.clone() }).await {
+                                Ok(AuthReply::Account { id, name: display }) => {
+                                    state.lock().unwrap().db.add_person(&id, &display)?;
+                                    Ok(id)
+                                }
+                                Ok(AuthReply::Error { text }) => Err(text),
+                                _ => Err("could not look that person up".to_string()),
+                            },
+                        };
+                        let opened = match other {
+                            Err(text) => Err(text),
+                            Ok(other) if other == user => Err("you cannot message yourself".to_string()),
+                            Ok(other) => {
+                                let is_local = state.lock().unwrap().db.is_member(&other)?;
+                                if !is_local && locations_of(&state, &auth_addr, &other).await.is_empty() {
+                                    Err(format!("{name} has not been online on any server yet"))
+                                } else {
+                                    let s = state.lock().unwrap();
                                     let joined = s.db.open_direct_message(&user, &other)?;
                                     let history = s.db.history(&joined)?;
                                     Ok((joined, history))
@@ -518,9 +551,19 @@ where
                             reactions: Vec::new(),
                         };
                         message.id = state.lock().unwrap().db.save_message(&message)?;
+                        let text = message.text.clone();
                         let _ = tx.send(ServerMsg::Message { message });
+                        if let Some(other) = cross_server_other(&state, &channel, &user)? {
+                            if let Err(e) = relay_out(&state, &auth_addr, &session_token, &other, &text).await {
+                                send(&mut writer, &ServerMsg::Error { text: format!("saved here, but not delivered: {e}") }).await?;
+                            }
+                        }
                     }
                     ClientMsg::React { id, emoji } => {
+                        if message_is_cross_server(&state, id)? {
+                            send(&mut writer, &ServerMsg::Error { text: CROSS_SERVER_CHANGES.into() }).await?;
+                            continue;
+                        }
                         if !common::is_reaction(&emoji) {
                             send(&mut writer, &ServerMsg::Error { text: "that reaction is not allowed".into() }).await?;
                             continue;
@@ -547,6 +590,10 @@ where
                         }
                     }
                     ClientMsg::Delete { id } => {
+                        if message_is_cross_server(&state, id)? {
+                            send(&mut writer, &ServerMsg::Error { text: CROSS_SERVER_CHANGES.into() }).await?;
+                            continue;
+                        }
                         // The author may delete a message, and so may the server owner.
                         let deleted = {
                             let s = state.lock().unwrap();
@@ -566,6 +613,10 @@ where
                         }
                     }
                     ClientMsg::Edit { id, text } => {
+                        if message_is_cross_server(&state, id)? {
+                            send(&mut writer, &ServerMsg::Error { text: CROSS_SERVER_CHANGES.into() }).await?;
+                            continue;
+                        }
                         let text = text.trim().to_string();
                         if text.is_empty() {
                             continue;
@@ -747,6 +798,146 @@ fn direct_message_list(state: &SharedState, user: &str) -> rusqlite::Result<Vec<
 /// Works out who a connecting token belongs to. The auth service is asked first. If it cannot be
 /// reached, a session it confirmed within `SESSION_CACHE_SECS` is still accepted. A session the
 /// auth service rejects is refused at once and forgotten here.
+/// Asks the auth service something and returns its reply. Its certificate is checked against the one
+/// remembered, the same way `verify_session` does.
+async fn auth_call(state: &SharedState, auth_addr: &str, request: &AuthRequest) -> Result<AuthReply, String> {
+    let (mut stream, fingerprint) = common::tls::connect_async(auth_addr)
+        .await
+        .map_err(|e| format!("auth service unavailable: {e}"))?;
+    if !pin_ok(state, "auth", auth_addr, &fingerprint) {
+        return Err("the auth service's certificate has changed".into());
+    }
+    let mut line = serde_json::to_string(request).map_err(|e| e.to_string())?;
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| format!("auth service unavailable: {e}"))?;
+    let mut lines = BufReader::new(stream).lines();
+    let reply = lines
+        .next_line()
+        .await
+        .map_err(|e| format!("auth service unavailable: {e}"))?
+        .ok_or_else(|| "auth service closed the connection".to_string())?;
+    serde_json::from_str(&reply).map_err(|e| format!("bad reply from auth service: {e}"))
+}
+
+/// The servers an account was last seen at, most recent first. Empty if none are known or the auth
+/// service cannot be asked.
+async fn locations_of(state: &SharedState, auth_addr: &str, id: &str) -> Vec<String> {
+    match auth_call(state, auth_addr, &AuthRequest::Locate { id: id.to_string() }).await {
+        Ok(AuthReply::Locations { addrs }) => addrs,
+        _ => Vec::new(),
+    }
+}
+
+/// Sends one message to another chat server and returns its answer. That server's certificate is
+/// remembered the first time it is seen.
+async fn server_call(state: &SharedState, addr: &str, msg: &ClientMsg) -> Result<ServerMsg, String> {
+    let (mut stream, fingerprint) = common::tls::connect_async(addr)
+        .await
+        .map_err(|e| format!("could not reach {addr}: {e}"))?;
+    if !pin_ok(state, "server", addr, &fingerprint) {
+        return Err(format!("the certificate of {addr} has changed"));
+    }
+    let mut line = serde_json::to_string(msg).map_err(|e| e.to_string())?;
+    line.push('\n');
+    stream.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
+    let mut lines = BufReader::new(stream).lines();
+    let reply = lines
+        .next_line()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("{addr} closed the connection"))?;
+    serde_json::from_str(&reply).map_err(|e| e.to_string())
+}
+
+/// Stores a direct message that another server relayed from one of its members, and delivers it to
+/// anyone here who is viewing it.
+async fn relay_receive(
+    state: &SharedState,
+    auth_addr: &str,
+    tx: &broadcast::Sender<ServerMsg>,
+    token: &str,
+    to: &str,
+    text: &str,
+) -> Result<(), String> {
+    let sender = check_session(state, auth_addr, token).await?;
+    if sender.id == to {
+        return Err("you cannot message yourself".into());
+    }
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("the message is empty".into());
+    }
+    if text.chars().count() > MAX_TEXT_LEN {
+        return Err(format!("message longer than {MAX_TEXT_LEN} characters"));
+    }
+    let message = {
+        let s = state.lock().unwrap();
+        s.db.add_person(&sender.id, &sender.name).map_err(|e| e.to_string())?;
+        let channel = s.db.open_direct_message(&sender.id, to).map_err(|e| e.to_string())?;
+        let mut message = ChatMessage {
+            id: 0,
+            channel,
+            author: sender.name.clone(),
+            author_id: sender.id.clone(),
+            text,
+            timestamp: now_secs(),
+            edited: false,
+            reactions: Vec::new(),
+        };
+        message.id = s.db.save_message(&message).map_err(|e| e.to_string())?;
+        message
+    };
+    let _ = tx.send(ServerMsg::Message { message });
+    Ok(())
+}
+
+/// Passes a direct message to the server the recipient was last seen at, so their copy is stored
+/// there as well. Tries each known server in turn.
+async fn relay_out(
+    state: &SharedState,
+    auth_addr: &str,
+    token: &str,
+    to: &str,
+    text: &str,
+) -> Result<(), String> {
+    let own = state.lock().unwrap().advertise.clone();
+    let mut last_error = "they have not been online on any server yet".to_string();
+    for addr in locations_of(state, auth_addr, to).await.into_iter().filter(|a| *a != own) {
+        let msg = ClientMsg::RelayDm { token: token.to_string(), to: to.to_string(), text: text.to_string() };
+        match server_call(state, &addr, &msg).await {
+            Ok(ServerMsg::RelayAck { error: None }) => return Ok(()),
+            Ok(ServerMsg::RelayAck { error: Some(e) }) => last_error = e,
+            Ok(_) => last_error = format!("{addr} gave an unexpected reply"),
+            Err(e) => last_error = e,
+        }
+    }
+    Err(last_error)
+}
+
+/// The other member of a cross-server direct message, when `channel` is one and `user` is in it.
+fn cross_server_other(state: &SharedState, channel: &str, user: &str) -> rusqlite::Result<Option<String>> {
+    let s = state.lock().unwrap();
+    if !s.db.is_cross_server_dm(channel)? {
+        return Ok(None);
+    }
+    Ok(s.db.direct_message_pair(channel)?.map(|(a, b)| if a == user { b } else { a }))
+}
+
+/// Whether a message is in a direct message kept in step with another server.
+fn message_is_cross_server(state: &SharedState, id: i64) -> rusqlite::Result<bool> {
+    let s = state.lock().unwrap();
+    match s.db.message_channel(id)? {
+        Some(channel) => s.db.is_cross_server_dm(&channel),
+        None => Ok(false),
+    }
+}
+
+/// Whether a direct message was relayed from or to another server, so it cannot be changed here.
+const CROSS_SERVER_CHANGES: &str = "editing, deleting and reacting are not available on direct messages between servers yet";
+
 async fn check_session(state: &SharedState, auth_addr: &str, token: &str) -> Result<Identity, String> {
     match verify_session(state, auth_addr, token).await {
         Ok(identity) => {
