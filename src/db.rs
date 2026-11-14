@@ -194,13 +194,28 @@ impl Db {
             "INSERT OR IGNORE INTO server_info (key, value) VALUES ('public', '0')",
             [],
         )?;
-        for channel in DEFAULT_CHANNELS {
-            conn.execute("INSERT OR IGNORE INTO channels (name) VALUES (?1)", params![channel])?;
+        // The default channels are made once, for a new database. A channel that was deleted later
+        // stays deleted.
+        let seeded: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM server_info WHERE key = 'channels_seeded'",
+            [],
+            |row| row.get(0),
+        )?;
+        if seeded == 0 {
+            let existing: i64 = conn.query_row("SELECT COUNT(*) FROM channels", [], |row| row.get(0))?;
+            if existing == 0 {
+                for channel in DEFAULT_CHANNELS {
+                    conn.execute("INSERT OR IGNORE INTO channels (name) VALUES (?1)", params![channel])?;
+                }
+            }
+            conn.execute("INSERT INTO server_info (key, value) VALUES ('channels_seeded', '1')", [])?;
         }
         // Every message names its channel by ID. Channels with messages but no row (direct messages)
         // get one here.
+        // Only messages that still lack a channel id may need a channel row. Channels deleted on
+        // purpose must not come back from the names their old messages carry.
         conn.execute(
-            "INSERT OR IGNORE INTO channels (name) SELECT DISTINCT channel FROM messages",
+            "INSERT OR IGNORE INTO channels (name) SELECT DISTINCT channel FROM messages WHERE channel_id IS NULL",
             [],
         )?;
         conn.execute(
@@ -613,11 +628,15 @@ impl Db {
     /// Deletes a channel with its messages and their reactions. Returns false when there is no such
     /// channel.
     pub fn delete_channel(&self, id: i64) -> rusqlite::Result<bool> {
+        // Messages are matched by id, and by name for messages written before ids existed, so none
+        // are left behind to bring the channel back.
+        let name = self.channel_name(id)?.unwrap_or_default();
+        let matches = "channel_id = ?1 OR (channel_id IS NULL AND channel = ?2)";
         self.conn.execute(
-            "DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE channel_id = ?1)",
-            params![id],
+            &format!("DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE {matches})"),
+            params![id, name],
         )?;
-        self.conn.execute("DELETE FROM messages WHERE channel_id = ?1", params![id])?;
+        self.conn.execute(&format!("DELETE FROM messages WHERE {matches}"), params![id, name])?;
         Ok(self.conn.execute("DELETE FROM channels WHERE id = ?1", params![id])? > 0)
     }
 
@@ -1106,5 +1125,53 @@ mod member_id_tests {
         assert!(!db.legacy_ids().unwrap().contains(&"alice".to_string()), "no old id is left");
         assert_eq!(db.history(general).unwrap()[0].author_id, new_id, "messages follow the new id");
         assert!(db.is_direct_message_member(&dm, &new_id).unwrap(), "direct messages follow it too");
+    }
+}
+
+#[cfg(test)]
+mod default_channel_tests {
+    use super::*;
+
+    #[test]
+    fn a_deleted_default_channel_stays_deleted_after_a_restart() {
+        let path = std::env::temp_dir().join(format!("vaxelium-defaults-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let path_str = path.to_str().unwrap();
+        {
+            let db = Db::open(path_str).unwrap();
+            assert!(db.channel_id("general").unwrap().is_some(), "a new database has the defaults");
+            let general = db.channel_id("general").unwrap().unwrap();
+            assert!(db.delete_channel(general).unwrap());
+        }
+        let db = Db::open(path_str).unwrap();
+        assert!(db.channel_id("general").unwrap().is_none(), "restarting does not bring it back");
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod resurrect_tests {
+    use super::*;
+
+    #[test]
+    fn a_deleted_channel_is_not_recreated_from_old_messages_on_boot() {
+        let path = std::env::temp_dir().join(format!("vaxelium-resurrect-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let path_str = path.to_str().unwrap();
+        {
+            let db = Db::open(path_str).unwrap();
+            let general = db.channel_id("general").unwrap().unwrap();
+            // A message written by an older server: it has the channel's name but no channel id.
+            db.conn
+                .execute(
+                    "INSERT INTO messages (channel, author, text, timestamp) VALUES ('general', 'u1', 'old', 1)",
+                    [],
+                )
+                .unwrap();
+            assert!(db.delete_channel(general).unwrap());
+        }
+        let db = Db::open(path_str).unwrap();
+        assert!(db.channel_id("general").unwrap().is_none(), "boot brought general back");
+        let _ = std::fs::remove_file(&path);
     }
 }
