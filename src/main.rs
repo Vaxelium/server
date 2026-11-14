@@ -329,8 +329,9 @@ where
         (s.presence(), s.db.server_name()?, s.db.server_description()?, s.db.server_icon()?)
     };
 
-    let mut channel = "general".to_string();
-    let mut channel_id = state.lock().unwrap().db.ensure_channel(&channel)?;
+    // No channel is open until the client joins one. Joining creates a channel only when it is asked for by name.
+    let mut channel = String::new();
+    let mut channel_id: i64 = 0;
     // Removes the user and broadcasts presence on every exit path, including errors.
     let _online = OnlineGuard { state: state.clone(), tx: tx.clone(), user: user.clone() };
     let server_public = state.lock().unwrap().db.is_public().unwrap_or(false);
@@ -674,6 +675,10 @@ where
                     }
 
                     ClientMsg::Say { text } => {
+                        if channel_id == 0 {
+                            send(&mut writer, &ServerMsg::Error { text: "join a channel first".into() }).await?;
+                            continue;
+                        }
                         let text = text.trim().to_string();
                         if text.is_empty() {
                             continue;
@@ -835,9 +840,8 @@ where
                     Ok(ServerMsg::ChannelDeleted { id }) => {
                         // A connection that had the channel open moves to general.
                         if channel_id == id {
-                            let general = state.lock().unwrap().db.ensure_channel("general")?;
-                            channel = "general".to_string();
-                            channel_id = general;
+                            channel = String::new();
+                            channel_id = 0;
                         }
                         send(&mut writer, &ServerMsg::ChannelDeleted { id }).await?;
                     }
