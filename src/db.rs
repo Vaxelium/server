@@ -20,6 +20,10 @@ CREATE TABLE IF NOT EXISTS server_info (
 CREATE TABLE IF NOT EXISTS channels (
     name TEXT PRIMARY KEY
 );
+CREATE TABLE IF NOT EXISTS categories (
+    name     TEXT PRIMARY KEY,
+    position INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS reactions (
     message_id INTEGER NOT NULL,
     emoji      TEXT NOT NULL,
@@ -70,6 +74,8 @@ impl Db {
         // Members get a display name separate from their id. Older databases lack it.
         let _ = conn.execute("ALTER TABLE members ADD COLUMN display TEXT", []);
         let _ = conn.execute("ALTER TABLE session_cache ADD COLUMN id TEXT", []);
+        // Channels made before categories lack this column. It is the category a channel is in.
+        let _ = conn.execute("ALTER TABLE channels ADD COLUMN category TEXT", []);
         // Accounts and users tables from older versions are no longer used. Chat servers keep no
         // accounts; the auth service does. A database with the auth service's `sessions` table is
         // never touched.
@@ -416,6 +422,66 @@ impl Db {
         Ok(())
     }
 
+    /// Adds a category. Returns false when one with that name already exists.
+    pub fn create_category(&self, name: &str) -> rusqlite::Result<bool> {
+        let position: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(position), 0) + 1 FROM categories",
+            [],
+            |row| row.get(0),
+        )?;
+        let added = self
+            .conn
+            .execute("INSERT OR IGNORE INTO categories (name, position) VALUES (?1, ?2)", params![name, position])?;
+        Ok(added > 0)
+    }
+
+    /// Removes a category. Its channels are kept and become uncategorized. Returns false when there
+    /// was no such category.
+    pub fn delete_category(&self, name: &str) -> rusqlite::Result<bool> {
+        self.conn.execute("UPDATE channels SET category = NULL WHERE category = ?1", params![name])?;
+        let removed = self.conn.execute("DELETE FROM categories WHERE name = ?1", params![name])?;
+        Ok(removed > 0)
+    }
+
+    pub fn category_exists(&self, name: &str) -> rusqlite::Result<bool> {
+        let count: i64 =
+            self.conn.query_row("SELECT COUNT(*) FROM categories WHERE name = ?1", params![name], |row| row.get(0))?;
+        Ok(count > 0)
+    }
+
+    /// Puts a channel in a category, or takes it out with `None`. The channel is created if needed.
+    pub fn move_channel(&self, channel: &str, category: Option<&str>) -> rusqlite::Result<()> {
+        self.ensure_channel(channel)?;
+        self.conn.execute("UPDATE channels SET category = ?2 WHERE name = ?1", params![channel, category])?;
+        Ok(())
+    }
+
+    /// Renames a channel and its messages. Returns false when the old channel does not exist or the
+    /// new name is already taken.
+    pub fn rename_channel(&self, old: &str, new: &str) -> rusqlite::Result<bool> {
+        let taken: i64 = self.conn.query_row("SELECT COUNT(*) FROM channels WHERE name = ?1", params![new], |r| r.get(0))?;
+        let exists: i64 = self.conn.query_row("SELECT COUNT(*) FROM channels WHERE name = ?1", params![old], |r| r.get(0))?;
+        if taken > 0 || exists == 0 {
+            return Ok(false);
+        }
+        self.conn.execute("UPDATE channels SET name = ?2 WHERE name = ?1", params![old, new])?;
+        self.conn.execute("UPDATE messages SET channel = ?2 WHERE channel = ?1", params![old, new])?;
+        Ok(true)
+    }
+
+    /// Every category in order, with its channels.
+    pub fn categories(&self) -> rusqlite::Result<Vec<common::CategoryInfo>> {
+        let mut stmt = self.conn.prepare("SELECT name FROM categories ORDER BY position, name")?;
+        let names: Vec<String> = stmt.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let mut out = Vec::new();
+        for name in names {
+            let mut stmt = self.conn.prepare("SELECT name FROM channels WHERE category = ?1 ORDER BY name")?;
+            let channels = stmt.query_map(params![name], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+            out.push(common::CategoryInfo { name, channels });
+        }
+        Ok(out)
+    }
+
     pub fn channel_names(&self) -> rusqlite::Result<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT name FROM channels ORDER BY name")?;
         let names = stmt.query_map([], |row| row.get(0))?;
@@ -614,5 +680,64 @@ mod tests {
         assert_eq!(db.delete_message(in_channel, "owner", true).unwrap().as_deref(), Some("general"));
         // The author can delete their own direct message.
         assert_eq!(db.delete_message(in_dm, "alice", false).unwrap().as_deref(), Some(dm.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod category_tests {
+    use super::*;
+
+    #[test]
+    fn categories_group_channels_and_deleting_keeps_them() {
+        let db = Db::open(":memory:").unwrap();
+        assert!(db.create_category("Text").unwrap());
+        assert!(!db.create_category("Text").unwrap(), "names are unique");
+        db.move_channel("general", Some("Text")).unwrap();
+        db.move_channel("random", None).unwrap();
+        let cats = db.categories().unwrap();
+        assert_eq!(cats.len(), 1);
+        assert_eq!(cats[0].name, "Text");
+        assert_eq!(cats[0].channels, vec!["general".to_string()]);
+
+        assert!(db.delete_category("Text").unwrap());
+        assert!(db.categories().unwrap().is_empty());
+        // The channel still exists and is uncategorized.
+        assert!(db.channel_names().unwrap().contains(&"general".to_string()));
+        assert!(!db.delete_category("Text").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+
+    #[test]
+    fn renaming_moves_messages_and_refuses_taken_names() {
+        let db = Db::open(":memory:").unwrap();
+        db.ensure_channel("general").unwrap();
+        db.ensure_channel("chat").unwrap();
+        db.create_category("Text").unwrap();
+        db.move_channel("general", Some("Text")).unwrap();
+        let m = ChatMessage {
+            id: 0,
+            channel: "general".into(),
+            author: "alice".into(),
+            author_id: "u1".into(),
+            text: "hi".into(),
+            timestamp: 1,
+            edited: false,
+            reactions: Vec::new(),
+        };
+        db.save_message(&m).unwrap();
+
+        assert!(!db.rename_channel("general", "chat").unwrap(), "the new name is taken");
+        assert!(!db.rename_channel("missing", "other").unwrap(), "the old channel must exist");
+        assert!(db.rename_channel("general", "lobby").unwrap());
+
+        let names = db.channel_names().unwrap();
+        assert!(names.contains(&"lobby".to_string()));
+        assert!(!names.contains(&"general".to_string()));
+        assert_eq!(db.history("lobby").unwrap().len(), 1, "messages move with the channel");
+        assert_eq!(db.categories().unwrap()[0].channels, vec!["lobby".to_string()], "the category keeps it");
     }
 }

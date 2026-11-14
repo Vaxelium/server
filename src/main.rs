@@ -18,6 +18,7 @@ use tokio::sync::broadcast;
 
 const MAX_TEXT_LEN: usize = 2000;
 const MAX_SERVER_NAME_LEN: usize = 40;
+const MAX_CATEGORY_NAME_LEN: usize = 32;
 const DEFAULT_DB_PATH: &str = "vaxelium.db";
 /// How long a session confirmed by the auth service keeps working on this server while the auth
 /// service cannot be reached.
@@ -434,8 +435,80 @@ where
                     }
 
                     ClientMsg::ListChannels => {
-                        let channels = state.lock().unwrap().db.channel_names()?;
+                        let (channels, categories) = {
+                            let s = state.lock().unwrap();
+                            (s.db.channel_names()?, s.db.categories()?)
+                        };
                         send(&mut writer, &ServerMsg::Channels { channels }).await?;
+                        send(&mut writer, &ServerMsg::Categories { categories }).await?;
+                    }
+
+                    ClientMsg::CreateCategory { name } => {
+                        let name = name.trim().to_string();
+                        if name.is_empty() || name.chars().count() > MAX_CATEGORY_NAME_LEN {
+                            send(&mut writer, &ServerMsg::Error {
+                                text: format!("category name must be 1-{MAX_CATEGORY_NAME_LEN} characters"),
+                            })
+                            .await?;
+                            continue;
+                        }
+                        let added = state.lock().unwrap().db.create_category(&name)?;
+                        if added {
+                            broadcast_categories(&state, &tx)?;
+                        } else {
+                            send(&mut writer, &ServerMsg::Error { text: "a category with that name already exists".into() }).await?;
+                        }
+                    }
+
+                    ClientMsg::DeleteCategory { name } => {
+                        let removed = state.lock().unwrap().db.delete_category(name.trim())?;
+                        if removed {
+                            broadcast_categories(&state, &tx)?;
+                        } else {
+                            send(&mut writer, &ServerMsg::Error { text: "there is no such category".into() }).await?;
+                        }
+                    }
+
+                    ClientMsg::RenameChannel { channel, new_name } => {
+                        let old = normalize_channel(&channel);
+                        let new = normalize_channel(&new_name);
+                        if old.is_empty() || old.starts_with("dm-") || new.is_empty() || new.starts_with("dm-") {
+                            send(&mut writer, &ServerMsg::Error { text: "that channel cannot be renamed".into() }).await?;
+                            continue;
+                        }
+                        let renamed = state.lock().unwrap().db.rename_channel(&old, &new)?;
+                        if renamed {
+                            let _ = tx.send(ServerMsg::ChannelRenamed { old, new });
+                            broadcast_categories(&state, &tx)?;
+                        } else {
+                            send(&mut writer, &ServerMsg::Error {
+                                text: "there is no such channel, or a channel with the new name already exists".into(),
+                            })
+                            .await?;
+                        }
+                    }
+
+                    ClientMsg::MoveChannel { channel, category } => {
+                        let channel = normalize_channel(&channel);
+                        if channel.is_empty() || channel.starts_with("dm-") {
+                            send(&mut writer, &ServerMsg::Error { text: "that channel cannot be moved".into() }).await?;
+                            continue;
+                        }
+                        let category = category.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+                        let moved = {
+                            let s = state.lock().unwrap();
+                            match &category {
+                                Some(c) if !s.db.category_exists(c)? => Err("there is no such category"),
+                                _ => {
+                                    s.db.move_channel(&channel, category.as_deref())?;
+                                    Ok(())
+                                }
+                            }
+                        };
+                        match moved {
+                            Ok(()) => broadcast_categories(&state, &tx)?,
+                            Err(text) => send(&mut writer, &ServerMsg::Error { text: text.into() }).await?,
+                        }
                     }
 
                     ClientMsg::SetServerIcon { png_base64 } => {
@@ -682,6 +755,16 @@ where
                     }
                     Ok(updated @ ServerMsg::ServerUpdated { .. }) => {
                         send(&mut writer, &updated).await?;
+                    }
+                    Ok(cats @ ServerMsg::Categories { .. }) => {
+                        send(&mut writer, &cats).await?;
+                    }
+                    Ok(ServerMsg::ChannelRenamed { old, new }) => {
+                        // A connection that was in the channel follows it to its new name.
+                        if channel == old {
+                            channel = new.clone();
+                        }
+                        send(&mut writer, &ServerMsg::ChannelRenamed { old, new }).await?;
                     }
                     Ok(_) => {}
                     // Slow client fell behind; skip the dropped events and keep going.
@@ -1030,6 +1113,13 @@ async fn send<W: AsyncWrite + Unpin>(writer: &mut W, msg: &ServerMsg) -> anyhow:
     let mut line = serde_json::to_string(msg)?;
     line.push('\n');
     writer.write_all(line.as_bytes()).await?;
+    Ok(())
+}
+
+/// Sends the current categories to every connection.
+fn broadcast_categories(state: &Arc<Mutex<State>>, tx: &broadcast::Sender<ServerMsg>) -> Result<(), rusqlite::Error> {
+    let categories = state.lock().unwrap().db.categories()?;
+    let _ = tx.send(ServerMsg::Categories { categories });
     Ok(())
 }
 
