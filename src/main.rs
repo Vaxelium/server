@@ -361,6 +361,8 @@ where
     send(&mut writer, &welcome).await?;
     let roles = state.lock().unwrap().db.role_list()?;
     send(&mut writer, &ServerMsg::Roles { roles }).await?;
+    let overrides = state.lock().unwrap().db.channel_overrides()?;
+    send(&mut writer, &ServerMsg::ChannelOverrides { overrides }).await?;
     {
         // Lets others message this account from another server. Does not hold up the welcome.
         let own = state.lock().unwrap().advertise.clone();
@@ -474,7 +476,10 @@ where
                     ClientMsg::ListChannels => {
                         let (channels, categories, uncategorized) = {
                             let s = state.lock().unwrap();
-                            (s.db.channel_list()?, s.db.categories()?, s.db.uncategorized_channels()?)
+                            let access = Access::new(&s.db, &user)?;
+                            let (categories, uncategorized) = visible_layout(&access, s.db.categories()?, s.db.uncategorized_channels()?);
+                            let channels = s.db.channel_list()?.into_iter().filter(|c| access.allows(c.id, perm::VIEW_CHANNEL)).collect();
+                            (channels, categories, uncategorized)
                         };
                         send(&mut writer, &ServerMsg::Channels { channels }).await?;
                         send(&mut writer, &ServerMsg::Categories { categories, uncategorized }).await?;
@@ -723,6 +728,17 @@ where
                             .await?;
                             continue;
                         }
+                        let visible = {
+                            let s = state.lock().unwrap();
+                            match s.db.channel_id(&requested)? {
+                                Some(id) => Access::new(&s.db, &user)?.allows(id, perm::VIEW_CHANNEL),
+                                None => true,
+                            }
+                        };
+                        if !visible {
+                            send(&mut writer, &ServerMsg::Error { text: CANNOT_VIEW.into() }).await?;
+                            continue;
+                        }
                         match join_channel(&state, &user, &requested)? {
                             Some((id, history)) => {
                                 channel = requested.clone();
@@ -741,6 +757,14 @@ where
                             send(&mut writer, &ServerMsg::Error { text: "there is no such channel".into() }).await?;
                             continue;
                         };
+                        let visible = {
+                            let s = state.lock().unwrap();
+                            Access::new(&s.db, &user)?.allows(id, perm::VIEW_CHANNEL)
+                        };
+                        if !visible {
+                            send(&mut writer, &ServerMsg::Error { text: CANNOT_VIEW.into() }).await?;
+                            continue;
+                        }
                         match join_channel(&state, &user, &name)? {
                             Some((id, history)) => {
                                 channel = name.clone();
@@ -756,6 +780,15 @@ where
                     ClientMsg::Say { text } => {
                         if channel_id == 0 {
                             send(&mut writer, &ServerMsg::Error { text: "join a channel first".into() }).await?;
+                            continue;
+                        }
+                        let access = Access::new(&state.lock().unwrap().db, &user)?;
+                        if !access.allows(channel_id, perm::VIEW_CHANNEL) {
+                            send(&mut writer, &ServerMsg::Error { text: CANNOT_VIEW.into() }).await?;
+                            continue;
+                        }
+                        if !access.allows(channel_id, perm::SEND_MESSAGES) {
+                            send(&mut writer, &ServerMsg::Error { text: CANNOT_SEND.into() }).await?;
                             continue;
                         }
                         let text = text.trim().to_string();
@@ -789,7 +822,38 @@ where
                             }
                         }
                     }
+                    ClientMsg::SetChannelOverride { channel, role, view, send: send_setting } => {
+                        if !may(&state, &user, perm::MANAGE_CHANNELS)? {
+                            send(&mut writer, &ServerMsg::Error { text: "you need the Manage channels permission for that".into() }).await?;
+                            continue;
+                        }
+                        let result = {
+                            let s = state.lock().unwrap();
+                            match s.db.channel_name(channel)? {
+                                None => Err("there is no such channel".to_string()),
+                                Some(name) if name.starts_with("dm-") => Err("direct messages can't have channel permissions".to_string()),
+                                Some(_) if role != EVERYONE_ROLE && !s.db.role_list()?.iter().any(|r| r.id == role) => {
+                                    Err("there is no such role".to_string())
+                                }
+                                Some(_) => {
+                                    s.db.set_channel_override(channel, role, view, send_setting)?;
+                                    Ok(s.db.channel_overrides()?)
+                                }
+                            }
+                        };
+                        match result {
+                            Ok(overrides) => {
+                                let _ = tx.send(ServerMsg::ChannelOverrides { overrides });
+                            }
+                            Err(text) => send(&mut writer, &ServerMsg::Error { text }).await?,
+                        }
+                    }
+
                     ClientMsg::React { id, emoji } => {
+                        if !message_visible(&state, &user, id)? {
+                            send(&mut writer, &ServerMsg::Error { text: CANNOT_VIEW.into() }).await?;
+                            continue;
+                        }
                         if message_is_cross_server(&state, id)? {
                             send(&mut writer, &ServerMsg::Error { text: CROSS_SERVER_CHANGES.into() }).await?;
                             continue;
@@ -820,6 +884,10 @@ where
                         }
                     }
                     ClientMsg::Delete { id } => {
+                        if !message_visible(&state, &user, id)? {
+                            send(&mut writer, &ServerMsg::Error { text: CANNOT_VIEW.into() }).await?;
+                            continue;
+                        }
                         if message_is_cross_server(&state, id)? {
                             send(&mut writer, &ServerMsg::Error { text: CROSS_SERVER_CHANGES.into() }).await?;
                             continue;
@@ -840,6 +908,10 @@ where
                         }
                     }
                     ClientMsg::Edit { id, text } => {
+                        if !message_visible(&state, &user, id)? {
+                            send(&mut writer, &ServerMsg::Error { text: CANNOT_VIEW.into() }).await?;
+                            continue;
+                        }
                         if message_is_cross_server(&state, id)? {
                             send(&mut writer, &ServerMsg::Error { text: CROSS_SERVER_CHANGES.into() }).await?;
                             continue;
@@ -875,14 +947,20 @@ where
                 match event {
                     Ok(ServerMsg::Message { message }) => {
                         if message.channel_id == channel_id {
-                            send(&mut writer, &ServerMsg::Message { message }).await?;
+                            let viewable = Access::new(&state.lock().unwrap().db, &user)?.allows(channel_id, perm::VIEW_CHANNEL);
+                            if viewable {
+                                send(&mut writer, &ServerMsg::Message { message }).await?;
+                            }
                         } else {
                             // Tell the client there is unread activity, without the content. A
-                            // direct message is announced only to its members.
+                            // direct message is announced only to its members, and a channel only
+                            // to members who may view it.
                             let allowed = {
                                 let s = state.lock().unwrap();
-                                !message.channel.starts_with("dm-")
-                                    || s.db.is_direct_message_member(&message.channel, &user)?
+                                let access = Access::new(&s.db, &user)?;
+                                access.allows(message.channel_id, perm::VIEW_CHANNEL)
+                                    && (!message.channel.starts_with("dm-")
+                                        || s.db.is_direct_message_member(&message.channel, &user)?)
                             };
                             if allowed {
                                 send(&mut writer, &ServerMsg::Activity { channel_id: message.channel_id }).await?;
@@ -890,16 +968,27 @@ where
                         }
                     }
                     Ok(ServerMsg::System { channel_id: c, text }) if c == channel_id => {
-                        send(&mut writer, &ServerMsg::System { channel_id: c, text }).await?;
+                        if Access::new(&state.lock().unwrap().db, &user)?.allows(c, perm::VIEW_CHANNEL) {
+                            send(&mut writer, &ServerMsg::System { channel_id: c, text }).await?;
+                        }
                     }
                     Ok(ServerMsg::MessageEdited { channel_id: c, id, text }) if c == channel_id => {
-                        send(&mut writer, &ServerMsg::MessageEdited { channel_id: c, id, text }).await?;
+                        if Access::new(&state.lock().unwrap().db, &user)?.allows(c, perm::VIEW_CHANNEL) {
+                            send(&mut writer, &ServerMsg::MessageEdited { channel_id: c, id, text }).await?;
+                        }
                     }
                     Ok(ServerMsg::MessageDeleted { channel_id: c, id }) if c == channel_id => {
-                        send(&mut writer, &ServerMsg::MessageDeleted { channel_id: c, id }).await?;
+                        if Access::new(&state.lock().unwrap().db, &user)?.allows(c, perm::VIEW_CHANNEL) {
+                            send(&mut writer, &ServerMsg::MessageDeleted { channel_id: c, id }).await?;
+                        }
                     }
                     Ok(ServerMsg::Reactions { channel_id: c, id, reactions }) if c == channel_id => {
-                        send(&mut writer, &ServerMsg::Reactions { channel_id: c, id, reactions }).await?;
+                        if Access::new(&state.lock().unwrap().db, &user)?.allows(c, perm::VIEW_CHANNEL) {
+                            send(&mut writer, &ServerMsg::Reactions { channel_id: c, id, reactions }).await?;
+                        }
+                    }
+                    Ok(overrides @ ServerMsg::ChannelOverrides { .. }) => {
+                        send(&mut writer, &overrides).await?;
                     }
                     Ok(presence @ ServerMsg::Presence { .. }) => {
                         send(&mut writer, &presence).await?;
@@ -913,8 +1002,14 @@ where
                     Ok(updated @ ServerMsg::ServerUpdated { .. }) => {
                         send(&mut writer, &updated).await?;
                     }
-                    Ok(cats @ ServerMsg::Categories { .. }) => {
-                        send(&mut writer, &cats).await?;
+                    Ok(ServerMsg::Categories { .. }) => {
+                        // Each member gets the layout with only the channels they may view.
+                        let (categories, uncategorized) = {
+                            let s = state.lock().unwrap();
+                            let access = Access::new(&s.db, &user)?;
+                            visible_layout(&access, s.db.categories()?, s.db.uncategorized_channels()?)
+                        };
+                        send(&mut writer, &ServerMsg::Categories { categories, uncategorized }).await?;
                     }
                     Ok(ServerMsg::ChannelDeleted { id }) => {
                         // A connection that had the channel open moves to general.
@@ -1318,7 +1413,16 @@ struct Power {
 
 impl Power {
     fn has(&self, permission: u32) -> bool {
-        self.owner || self.perms & permission == permission
+        self.owner || self.perms & perm::ADMINISTRATOR != 0 || self.perms & permission == permission
+    }
+
+    /// The permissions this member may give to a role: all of them for an owner or administrator.
+    fn grantable(&self) -> u32 {
+        if self.owner || self.perms & perm::ADMINISTRATOR != 0 {
+            perm::ALL
+        } else {
+            self.perms
+        }
     }
 
     /// True when the account is above the role at `index` in the role order, so it may manage it.
@@ -1352,6 +1456,96 @@ fn may(state: &SharedState, user: &str, permission: u32) -> rusqlite::Result<boo
     Ok(power_of(&s.db, user, &order)?.has(permission))
 }
 
+/// What one member may see and say. Worked out once from their roles, the owner, and the channel
+/// exceptions. A channel's exception for a role wins over the role's server-wide permission, and a
+/// denial from any of the member's roles wins over an allowance.
+struct Access {
+    power: Power,
+    /// The roles the member holds, @everyone included.
+    held: Vec<i64>,
+    overrides: Vec<common::ChannelOverride>,
+    /// The name of each channel, by id. Direct messages are told apart by their name.
+    names: std::collections::HashMap<i64, String>,
+}
+
+impl Access {
+    fn new(db: &Db, user: &str) -> rusqlite::Result<Self> {
+        let order = db.role_list()?;
+        let power = power_of(db, user, &order)?;
+        let mut held = db.member_role_ids(user)?;
+        held.push(EVERYONE_ROLE);
+        Ok(Access { power, held, overrides: db.channel_overrides()?, names: db.channel_names()? })
+    }
+
+    /// Whether the member may view (`VIEW_CHANNEL`) or send in (`SEND_MESSAGES`) a channel. Direct
+    /// messages are allowed here, since their members are checked where they are used.
+    fn allows(&self, channel_id: i64, bit: u32) -> bool {
+        match self.names.get(&channel_id) {
+            None => return false,
+            Some(name) if name.starts_with("dm-") => return true,
+            Some(_) => {}
+        }
+        if self.power.has(perm::MANAGE_CHANNELS) {
+            return true;
+        }
+        let mut allowed = false;
+        for o in self.overrides.iter().filter(|o| o.channel_id == channel_id && self.held.contains(&o.role)) {
+            let setting = if bit == perm::VIEW_CHANNEL { o.view } else { o.send };
+            match setting {
+                Some(false) => return false,
+                Some(true) => allowed = true,
+                None => {}
+            }
+        }
+        allowed || self.power.has(bit)
+    }
+}
+
+/// The categories and the channels outside them, with only the channels this member may view.
+fn visible_layout(access: &Access, categories: Vec<common::CategoryInfo>, uncategorized: Vec<common::ChannelRef>) -> (Vec<common::CategoryInfo>, Vec<common::ChannelRef>) {
+    let categories = categories
+        .into_iter()
+        .map(|mut c| {
+            c.channels.retain(|ch| access.allows(ch.id, perm::VIEW_CHANNEL));
+            c
+        })
+        .collect();
+    let uncategorized = uncategorized.into_iter().filter(|ch| access.allows(ch.id, perm::VIEW_CHANNEL)).collect();
+    (categories, uncategorized)
+}
+
+/// Whether `user` may view the channel a message is in. False when the message does not exist.
+fn message_visible(state: &SharedState, user: &str, id: i64) -> rusqlite::Result<bool> {
+    let s = state.lock().unwrap();
+    let Some(name) = s.db.message_channel(id)? else {
+        return Ok(false);
+    };
+    let Some(channel_id) = s.db.channel_id(&name)? else {
+        return Ok(false);
+    };
+    Ok(Access::new(&s.db, user)?.allows(channel_id, perm::VIEW_CHANNEL))
+}
+
+/// Says the channel cannot be used by this member, for the message that refuses them.
+const CANNOT_VIEW: &str = "you can't view that channel";
+const CANNOT_SEND: &str = "you can't send messages in that channel";
+
+/// The permissions @everyone keeps until another role has them.
+const EVERYONE_KEEPS_BITS: u32 = perm::VIEW_CHANNEL | perm::SEND_MESSAGES;
+const EVERYONE_KEEPS: &str = "@everyone keeps View channels and Message channels until another role has them";
+
+/// True when setting @everyone's permissions to `permissions` would drop one of the kept bits that no
+/// other role holds.
+fn removes_everyone_keep(db: &Db, permissions: u32) -> rusqlite::Result<bool> {
+    let others = db.role_list()?.into_iter().filter(|r| r.id != EVERYONE_ROLE).map(|r| r.permissions).collect::<Vec<_>>();
+    for bit in [perm::VIEW_CHANNEL, perm::SEND_MESSAGES] {
+        if EVERYONE_KEEPS_BITS & bit != 0 && permissions & bit == 0 && !others.iter().any(|p| p & (bit | perm::ADMINISTRATOR) != 0) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// A change to the roles, asked for by a member.
 enum RoleChange {
     Create { name: String, color: String, permissions: u32, mentionable: bool, hoisted: bool },
@@ -1374,7 +1568,7 @@ fn role_fields_error(power: &Power, name: &str, color: &str, permissions: u32) -
     if permissions & !perm::ALL != 0 {
         return Some("that permission does not exist".into());
     }
-    if permissions & !power.perms != 0 {
+    if permissions & !power.grantable() != 0 {
         return Some("you cannot give a role permissions you do not have".into());
     }
     None
@@ -1412,6 +1606,12 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
             }
             if let Some(text) = role_fields_error(&power, &name, &color, permissions) {
                 return Ok(Err(text));
+            }
+            if role == EVERYONE_ROLE && permissions & perm::ADMINISTRATOR != 0 {
+                return Ok(Err("@everyone cannot be an administrator".into()));
+            }
+            if role == EVERYONE_ROLE && removes_everyone_keep(&db, permissions)? {
+                return Ok(Err(EVERYONE_KEEPS.into()));
             }
             if db.role_name_taken(&name, role)? {
                 return Ok(Err("a role with that name already exists".into()));
@@ -1557,6 +1757,56 @@ mod role_tests {
         db.set_member_role("bob", admin, true).unwrap();
         db.set_member_role("dan", admin, true).unwrap();
         (db, admin, mods)
+    }
+
+    #[test]
+    fn channel_view_and_send_follow_roles_and_channel_exceptions() {
+        let (db, _, _) = server();
+        db.add_member("erin", "Erin", 5).unwrap();
+        let general = db.ensure_channel("general").unwrap();
+        let readers = db.create_role("Readers", "", perm::VIEW_CHANNEL | perm::SEND_MESSAGES, false, false).unwrap().unwrap();
+        let viewers = db.create_role("Viewers", "", perm::VIEW_CHANNEL, false, false).unwrap().unwrap();
+        db.set_member_role("bob", readers, true).unwrap();
+        db.set_member_role("carol", viewers, true).unwrap();
+        // Take the channel permissions off @everyone. Other roles hold them, so that is allowed.
+        let off = apply_role_change(
+            &db,
+            "owner",
+            RoleChange::Update { role: EVERYONE_ROLE, name: String::new(), color: String::new(), permissions: 0, mentionable: false, hoisted: false },
+        )
+        .unwrap();
+        assert_eq!(off, Ok(()));
+
+        // Nobody sees a channel without a role that gives it. Owners and managers see every channel.
+        assert!(!Access::new(&db, "erin").unwrap().allows(general, perm::VIEW_CHANNEL));
+        assert!(Access::new(&db, "owner").unwrap().allows(general, perm::SEND_MESSAGES));
+
+        let bob = Access::new(&db, "bob").unwrap();
+        assert!(bob.allows(general, perm::VIEW_CHANNEL) && bob.allows(general, perm::SEND_MESSAGES));
+
+        // A viewer may read, but not send.
+        let carol = Access::new(&db, "carol").unwrap();
+        assert!(carol.allows(general, perm::VIEW_CHANNEL));
+        assert!(!carol.allows(general, perm::SEND_MESSAGES));
+
+        // A denial on the channel for one of the member's roles hides it, even with a server-wide grant.
+        db.set_channel_override(general, viewers, Some(false), None).unwrap();
+        assert!(!Access::new(&db, "carol").unwrap().allows(general, perm::VIEW_CHANNEL));
+
+        // An allowance on the channel gives a role access it does not have server-wide.
+        db.set_channel_override(general, viewers, None, None).unwrap();
+        db.set_channel_override(general, EVERYONE_ROLE, Some(true), None).unwrap();
+        assert!(Access::new(&db, "erin").unwrap().allows(general, perm::VIEW_CHANNEL));
+
+        // A send denial stops sending but not viewing.
+        db.set_channel_override(general, viewers, None, Some(false)).unwrap();
+        assert!(!Access::new(&db, "carol").unwrap().allows(general, perm::SEND_MESSAGES));
+        assert!(Access::new(&db, "carol").unwrap().allows(general, perm::VIEW_CHANNEL));
+
+        // Removing an exception puts the server-wide permission back.
+        db.set_channel_override(general, viewers, None, None).unwrap();
+        assert!(!Access::new(&db, "carol").unwrap().allows(general, perm::SEND_MESSAGES));
+        assert!(db.channel_overrides().unwrap().iter().all(|o| o.role != viewers));
     }
 
     #[test]
@@ -1765,7 +2015,14 @@ mod everyone_tests {
         let given = apply_role_change(
             &db,
             "owner",
-            RoleChange::Update { role: EVERYONE_ROLE, name: "x".into(), color: "#112233".into(), permissions: perm::MANAGE_MESSAGES , mentionable: false, hoisted: false },
+            RoleChange::Update {
+                role: EVERYONE_ROLE,
+                name: "x".into(),
+                color: "#112233".into(),
+                permissions: perm::MANAGE_MESSAGES | perm::VIEW_CHANNEL | perm::SEND_MESSAGES,
+                mentionable: false,
+                hoisted: false,
+            },
         )
         .unwrap();
         assert_eq!(given, Ok(()));
@@ -1778,5 +2035,50 @@ mod everyone_tests {
         assert!(carol.has(perm::MANAGE_MESSAGES));
         assert!(!carol.has(perm::MANAGE_CHANNELS));
         assert!(carol.top.is_none());
+    }
+
+    #[test]
+    fn administrator_has_everything_even_when_a_channel_denies_it() {
+        let db = server();
+        db.add_member("erin", "Erin", 5).unwrap();
+        let general = db.ensure_channel("general").unwrap();
+        db.set_channel_override(general, EVERYONE_ROLE, None, None).unwrap();
+        let admins = db.create_role("Administrators", "", perm::ADMINISTRATOR, false, false).unwrap().unwrap();
+        db.set_member_role("erin", admins, true).unwrap();
+        db.set_channel_override(general, admins, Some(false), Some(false)).unwrap();
+        // The denial is for a role erin holds, but administrators can still see and send.
+        let erin = Access::new(&db, "erin").unwrap();
+        assert!(erin.allows(general, perm::VIEW_CHANNEL));
+        assert!(erin.allows(general, perm::SEND_MESSAGES));
+        assert!(erin.power.has(perm::MANAGE_ROLES));
+        // An administrator may give out any permission, since they have all of them.
+        let order = db.role_list().unwrap();
+        let power = power_of(&db, "erin", &order).unwrap();
+        assert_eq!(power.grantable(), perm::ALL);
+    }
+
+    #[test]
+    fn everyone_keeps_channel_permissions_until_another_role_has_them() {
+        let db = server();
+        let everyone = |permissions: u32| RoleChange::Update {
+            role: EVERYONE_ROLE,
+            name: String::new(),
+            color: String::new(),
+            permissions,
+            mentionable: false,
+            hoisted: false,
+        };
+        // @everyone starts with both channel permissions.
+        let start = db.role_list().unwrap().into_iter().find(|r| r.id == EVERYONE_ROLE).unwrap();
+        assert_eq!(start.permissions & (perm::VIEW_CHANNEL | perm::SEND_MESSAGES), perm::VIEW_CHANNEL | perm::SEND_MESSAGES);
+
+        // Nobody else holds them yet, so they cannot be taken away.
+        assert_eq!(apply_role_change(&db, "owner", everyone(0)).unwrap(), Err(EVERYONE_KEEPS.into()));
+        assert_eq!(apply_role_change(&db, "owner", everyone(perm::VIEW_CHANNEL)).unwrap(), Err(EVERYONE_KEEPS.into()));
+
+        // Once another role holds View channels, @everyone may drop it, but not Message channels.
+        db.create_role("Viewers", "", perm::VIEW_CHANNEL, false, false).unwrap().unwrap();
+        assert_eq!(apply_role_change(&db, "owner", everyone(perm::SEND_MESSAGES)).unwrap(), Ok(()));
+        assert_eq!(apply_role_change(&db, "owner", everyone(0)).unwrap(), Err(EVERYONE_KEEPS.into()));
     }
 }

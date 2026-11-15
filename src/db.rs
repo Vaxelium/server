@@ -73,6 +73,13 @@ CREATE TABLE IF NOT EXISTS direct_messages (
     b  TEXT NOT NULL,
     UNIQUE (a, b)
 );
+CREATE TABLE IF NOT EXISTS channel_overrides (
+    channel_id INTEGER NOT NULL,
+    role_id    INTEGER NOT NULL,
+    view       INTEGER,
+    send       INTEGER,
+    PRIMARY KEY (channel_id, role_id)
+);
 ";
 
 pub struct Db {
@@ -148,6 +155,14 @@ impl Db {
             "INSERT OR IGNORE INTO roles (id, name, color, permissions, position) VALUES (0, '@everyone', '', 0, -1000000000)",
             [],
         )?;
+        // Give @everyone View channels and Message channels once, for servers made before they existed.
+        // The flag keeps a later change by the owner from being undone at the next start.
+        if conn.execute("INSERT OR IGNORE INTO server_info (key, value) VALUES ('everyone_channel_perms', '1')", [])? == 1 {
+            conn.execute(
+                "UPDATE roles SET permissions = permissions | ?1 WHERE id = 0",
+                params![(common::perm::VIEW_CHANNEL | common::perm::SEND_MESSAGES) as i64],
+            )?;
+        }
         migrate_to_ids(&conn)?;
         // Direct messages made before cross-server ones lack this column; they are all local.
         let _ = conn.execute("ALTER TABLE direct_messages ADD COLUMN cross INTEGER NOT NULL DEFAULT 0", []);
@@ -777,6 +792,40 @@ impl Db {
 
     /// Saves a message and returns its new id.
     /// Every role, highest first.
+    /// The name of every channel, by id.
+    pub fn channel_names(&self) -> rusqlite::Result<std::collections::HashMap<i64, String>> {
+        let mut stmt = self.conn.prepare("SELECT id, name FROM channels")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+        rows.collect()
+    }
+
+    /// Every channel's exceptions for roles.
+    pub fn channel_overrides(&self) -> rusqlite::Result<Vec<common::ChannelOverride>> {
+        let mut stmt = self.conn.prepare("SELECT channel_id, role_id, view, send FROM channel_overrides ORDER BY channel_id, role_id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(common::ChannelOverride {
+                channel_id: row.get(0)?,
+                role: row.get(1)?,
+                view: row.get::<_, Option<i64>>(2)?.map(|v| v != 0),
+                send: row.get::<_, Option<i64>>(3)?.map(|v| v != 0),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Sets a role's exception for a channel. Both `None` removes it.
+    pub fn set_channel_override(&self, channel_id: i64, role: i64, view: Option<bool>, send: Option<bool>) -> rusqlite::Result<()> {
+        if view.is_none() && send.is_none() {
+            self.conn.execute("DELETE FROM channel_overrides WHERE channel_id = ?1 AND role_id = ?2", params![channel_id, role])?;
+        } else {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO channel_overrides (channel_id, role_id, view, send) VALUES (?1, ?2, ?3, ?4)",
+                params![channel_id, role, view.map(i64::from), send.map(i64::from)],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn role_list(&self) -> rusqlite::Result<Vec<common::RoleInfo>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, color, permissions, position, mentionable, hoisted FROM roles ORDER BY position DESC, id",
