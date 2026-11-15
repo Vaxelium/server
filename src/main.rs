@@ -687,13 +687,14 @@ where
                             .await?;
                             continue;
                         }
+                        let allowed = may(&state, &user, perm::MANAGE_SERVER)?;
                         let result = {
                             let s = state.lock().unwrap();
-                            if s.db.owner()?.as_deref() == Some(user.as_str()) {
+                            if allowed {
                                 s.db.set_server_icon(png_base64.as_deref())?;
                                 Ok(())
                             } else {
-                                Err("only the owner can change this server")
+                                Err("you need the Manage server permission to change this server")
                             }
                         };
                         match result {
@@ -721,14 +722,15 @@ where
                             .await?;
                             continue;
                         }
+                        let allowed = may(&state, &user, perm::MANAGE_SERVER)?;
                         let result = {
                             let s = state.lock().unwrap();
-                            if s.db.owner()?.as_deref() == Some(user.as_str()) {
+                            if allowed {
                                 s.db.set_server_name(&name)?;
                                 s.db.set_server_description(&description)?;
                                 Ok(())
                             } else {
-                                Err("only the owner can change this server")
+                                Err("you need the Manage server permission to change this server")
                             }
                         };
                         match result {
