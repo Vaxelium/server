@@ -59,6 +59,7 @@ impl State {
         let roles = self.db.all_member_roles().unwrap_or_default();
         let joined = self.db.first_seen_all().unwrap_or_default();
         let statuses = self.db.statuses().unwrap_or_default();
+        let badges = self.db.all_member_badges().unwrap_or_default();
         self.db
             .member_names()
             .unwrap_or_default()
@@ -72,7 +73,8 @@ impl State {
                 let status = statuses.get(&id).copied().unwrap_or_default();
                 // Invisible members are shown as offline, even while connected.
                 let online = online && status != common::PresenceStatus::Invisible;
-                UserStatus { id, name, online, owner, roles, joined, status }
+                let badges = badges.get(&id).cloned().unwrap_or_default();
+                UserStatus { id, name, online, owner, roles, joined, status, badges }
             })
             .collect()
     }
@@ -365,6 +367,8 @@ where
     send(&mut writer, &welcome).await?;
     let roles = state.lock().unwrap().db.role_list()?;
     send(&mut writer, &ServerMsg::Roles { roles }).await?;
+    let badges = state.lock().unwrap().db.badge_list()?;
+    send(&mut writer, &ServerMsg::Badges { badges }).await?;
     let overrides = state.lock().unwrap().db.channel_overrides()?;
     send(&mut writer, &ServerMsg::ChannelOverrides { overrides }).await?;
     {
@@ -652,6 +656,24 @@ where
                     ClientMsg::SetMemberRole { user: member, role, on } => {
                         let change = RoleChange::Member { user: member, role, on };
                         if let Some(text) = change_roles(&state, &tx, &user, change)? {
+                            send(&mut writer, &ServerMsg::Error { text }).await?;
+                        }
+                    }
+
+                    ClientMsg::CreateBadge { name, color } => {
+                        if let Some(text) = change_badges(&state, &tx, &user, BadgeChange::Create { name, color })? {
+                            send(&mut writer, &ServerMsg::Error { text }).await?;
+                        }
+                    }
+
+                    ClientMsg::DeleteBadge { badge } => {
+                        if let Some(text) = change_badges(&state, &tx, &user, BadgeChange::Delete { badge })? {
+                            send(&mut writer, &ServerMsg::Error { text }).await?;
+                        }
+                    }
+
+                    ClientMsg::SetMemberBadge { user: member, badge, on } => {
+                        if let Some(text) = change_badges(&state, &tx, &user, BadgeChange::Member { user: member, badge, on })? {
                             send(&mut writer, &ServerMsg::Error { text }).await?;
                         }
                     }
@@ -1715,6 +1737,68 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
 
 /// Applies a role change and tells everyone about the new roles and members. Returns why the change
 /// was refused, if it was.
+/// A change to the badges of this server, made by someone who may manage roles.
+enum BadgeChange {
+    Create { name: String, color: String },
+    Delete { badge: i64 },
+    Member { user: String, badge: i64, on: bool },
+}
+
+/// Applies a badge change, then tells every connection about the badges and the members' badges. Returns
+/// the reason when the change is refused.
+fn change_badges(
+    state: &SharedState,
+    tx: &broadcast::Sender<ServerMsg>,
+    user: &str,
+    change: BadgeChange,
+) -> rusqlite::Result<Option<String>> {
+    if !may(state, user, perm::MANAGE_ROLES)? {
+        return Ok(Some("you need the Manage roles permission to change badges".into()));
+    }
+    let refused = {
+        let s = state.lock().unwrap();
+        match change {
+            BadgeChange::Create { name, color } => {
+                let name = name.trim().to_string();
+                let color = color.trim().to_string();
+                if name.is_empty() || name.chars().count() > 32 {
+                    Some("a badge needs a name of 1 to 32 characters".to_string())
+                } else if color.len() > 16 {
+                    Some("that colour is not valid".to_string())
+                } else if s.db.create_badge(&name, &color)?.is_none() {
+                    Some("a badge with that name already exists".to_string())
+                } else {
+                    None
+                }
+            }
+            BadgeChange::Delete { badge } => match s.db.delete_badge(badge)? {
+                true => None,
+                false => Some("there is no such badge".to_string()),
+            },
+            BadgeChange::Member { user: member, badge, on } => {
+                if !s.db.badge_exists(badge)? {
+                    Some("there is no such badge".to_string())
+                } else if !s.db.is_member(&member)? {
+                    Some("that person is not a member of this server".to_string())
+                } else {
+                    s.db.set_member_badge(&member, badge, on)?;
+                    None
+                }
+            }
+        }
+    };
+    if refused.is_some() {
+        return Ok(refused);
+    }
+    let (badges, users) = {
+        let s = state.lock().unwrap();
+        (s.db.badge_list()?, s.presence())
+    };
+    let _ = tx.send(ServerMsg::Badges { badges });
+    let _ = tx.send(ServerMsg::Presence { users });
+    Ok(None)
+}
+
 fn change_roles(
     state: &SharedState,
     tx: &broadcast::Sender<ServerMsg>,
@@ -2120,5 +2204,23 @@ mod everyone_tests {
         db.create_role("Viewers", "", perm::VIEW_CHANNEL, false, false).unwrap().unwrap();
         assert_eq!(apply_role_change(&db, "owner", everyone(perm::SEND_MESSAGES)).unwrap(), Ok(()));
         assert_eq!(apply_role_change(&db, "owner", everyone(0)).unwrap(), Err(EVERYONE_KEEPS.into()));
+    }
+}
+
+#[cfg(test)]
+mod badge_tests {
+    use super::*;
+
+    #[test]
+    fn badges_are_unique_by_name_and_deleting_one_takes_it_from_members() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("bob", "Bob", 1).unwrap();
+        let helper = db.create_badge("Helper", "#2ecc71").unwrap().expect("made");
+        assert!(db.create_badge("Helper", "#000000").unwrap().is_none(), "the name is taken");
+        db.set_member_badge("bob", helper, true).unwrap();
+        assert_eq!(db.all_member_badges().unwrap().get("bob"), Some(&vec![helper]));
+        assert!(db.delete_badge(helper).unwrap());
+        assert!(db.badge_list().unwrap().is_empty());
+        assert!(db.all_member_badges().unwrap().get("bob").is_none());
     }
 }

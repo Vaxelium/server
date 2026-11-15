@@ -67,6 +67,16 @@ CREATE TABLE IF NOT EXISTS member_roles (
     role_id INTEGER NOT NULL,
     PRIMARY KEY (user_id, role_id)
 );
+CREATE TABLE IF NOT EXISTS badges (
+    id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    name  TEXT NOT NULL UNIQUE,
+    color TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS member_badges (
+    user_id  TEXT NOT NULL,
+    badge_id INTEGER NOT NULL,
+    PRIMARY KEY (user_id, badge_id)
+);
 CREATE TABLE IF NOT EXISTS direct_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     a  TEXT NOT NULL,
@@ -945,6 +955,53 @@ impl Db {
         for row in rows {
             let (user, role) = row?;
             map.entry(user).or_default().push(role);
+        }
+        Ok(map)
+    }
+
+    /// Every badge on this server, oldest first.
+    pub fn badge_list(&self) -> rusqlite::Result<Vec<common::Badge>> {
+        let mut stmt = self.conn.prepare("SELECT id, name, color FROM badges ORDER BY id")?;
+        let rows = stmt.query_map([], |row| Ok(common::Badge { id: row.get(0)?, name: row.get(1)?, color: row.get(2)? }))?;
+        rows.collect()
+    }
+
+    /// Creates a badge. Returns None when the name is already taken.
+    pub fn create_badge(&self, name: &str, color: &str) -> rusqlite::Result<Option<i64>> {
+        let added = self.conn.execute("INSERT OR IGNORE INTO badges (name, color) VALUES (?1, ?2)", params![name, color])?;
+        Ok((added > 0).then(|| self.conn.last_insert_rowid()))
+    }
+
+    /// Whether a badge with this id exists.
+    pub fn badge_exists(&self, id: i64) -> rusqlite::Result<bool> {
+        let found: i64 = self.conn.query_row("SELECT COUNT(*) FROM badges WHERE id = ?1", params![id], |row| row.get(0))?;
+        Ok(found > 0)
+    }
+
+    /// Removes a badge and takes it from everyone who had it. Returns false when there is no such badge.
+    pub fn delete_badge(&self, id: i64) -> rusqlite::Result<bool> {
+        self.conn.execute("DELETE FROM member_badges WHERE badge_id = ?1", params![id])?;
+        Ok(self.conn.execute("DELETE FROM badges WHERE id = ?1", params![id])? > 0)
+    }
+
+    /// Gives a member a badge, or takes it away.
+    pub fn set_member_badge(&self, user: &str, badge: i64, on: bool) -> rusqlite::Result<()> {
+        if on {
+            self.conn.execute("INSERT OR IGNORE INTO member_badges (user_id, badge_id) VALUES (?1, ?2)", params![user, badge])?;
+        } else {
+            self.conn.execute("DELETE FROM member_badges WHERE user_id = ?1 AND badge_id = ?2", params![user, badge])?;
+        }
+        Ok(())
+    }
+
+    /// The badge ids of every member who has any badge, by member id.
+    pub fn all_member_badges(&self) -> rusqlite::Result<std::collections::HashMap<String, Vec<i64>>> {
+        let mut stmt = self.conn.prepare("SELECT user_id, badge_id FROM member_badges")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        let mut map: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
+        for row in rows {
+            let (user, badge) = row?;
+            map.entry(user).or_default().push(badge);
         }
         Ok(map)
     }
