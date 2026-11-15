@@ -47,6 +47,7 @@ impl State {
         let owner = self.db.owner().ok().flatten();
         let names = self.db.display_names().unwrap_or_default();
         let roles = self.db.all_member_roles().unwrap_or_default();
+        let joined = self.db.first_seen_all().unwrap_or_default();
         self.db
             .member_names()
             .unwrap_or_default()
@@ -56,7 +57,8 @@ impl State {
                 let owner = owner.as_deref() == Some(id.as_str());
                 let name = names.get(&id).cloned().unwrap_or_else(|| id.clone());
                 let roles = roles.get(&id).cloned().unwrap_or_default();
-                UserStatus { id, name, online, owner, roles }
+                let joined = joined.get(&id).copied().unwrap_or(0);
+                UserStatus { id, name, online, owner, roles, joined }
             })
             .collect()
     }
