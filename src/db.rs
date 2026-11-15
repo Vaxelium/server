@@ -153,6 +153,9 @@ impl Db {
         let _ = conn.execute("ALTER TABLE direct_messages ADD COLUMN cross INTEGER NOT NULL DEFAULT 0", []);
         // Databases made before messages could be edited lack this column.
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0", []);
+        // Roles made before pings and member-list groups lack these columns.
+        let _ = conn.execute("ALTER TABLE roles ADD COLUMN mentionable INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE roles ADD COLUMN hoisted INTEGER NOT NULL DEFAULT 0", []);
         // Members get a display name separate from their id. Older databases lack it.
         let _ = conn.execute("ALTER TABLE members ADD COLUMN display TEXT", []);
         let _ = conn.execute("ALTER TABLE session_cache ADD COLUMN id TEXT", []);
@@ -769,7 +772,7 @@ impl Db {
     /// Every role, highest first.
     pub fn role_list(&self) -> rusqlite::Result<Vec<common::RoleInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, color, permissions, position FROM roles ORDER BY position DESC, id",
+            "SELECT id, name, color, permissions, position, mentionable, hoisted FROM roles ORDER BY position DESC, id",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(common::RoleInfo {
@@ -778,13 +781,15 @@ impl Db {
                 color: row.get(2)?,
                 permissions: row.get::<_, i64>(3)? as u32,
                 position: row.get(4)?,
+                mentionable: row.get::<_, i64>(5)? != 0,
+                hoisted: row.get::<_, i64>(6)? != 0,
             })
         })?;
         rows.collect()
     }
 
     /// Adds a role at the bottom of the hierarchy. Returns its id, or `None` when the name is taken.
-    pub fn create_role(&self, name: &str, color: &str, permissions: u32) -> rusqlite::Result<Option<i64>> {
+    pub fn create_role(&self, name: &str, color: &str, permissions: u32, mentionable: bool, hoisted: bool) -> rusqlite::Result<Option<i64>> {
         // Above @everyone, which sits at the very bottom.
         let position: i64 = self.conn.query_row(
             "SELECT COALESCE(MIN(position), 1) - 1 FROM roles WHERE id != 0",
@@ -792,8 +797,8 @@ impl Db {
             |row| row.get(0),
         )?;
         let added = self.conn.execute(
-            "INSERT OR IGNORE INTO roles (name, color, permissions, position) VALUES (?1, ?2, ?3, ?4)",
-            params![name, color, permissions as i64, position],
+            "INSERT OR IGNORE INTO roles (name, color, permissions, position, mentionable, hoisted) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![name, color, permissions as i64, position, mentionable as i64, hoisted as i64],
         )?;
         Ok((added > 0).then(|| self.conn.last_insert_rowid()))
     }
@@ -809,10 +814,10 @@ impl Db {
     }
 
     /// Changes a role's name, colour and permissions. Returns false when there is no such role.
-    pub fn update_role(&self, id: i64, name: &str, color: &str, permissions: u32) -> rusqlite::Result<bool> {
+    pub fn update_role(&self, id: i64, name: &str, color: &str, permissions: u32, mentionable: bool, hoisted: bool) -> rusqlite::Result<bool> {
         let changed = self.conn.execute(
-            "UPDATE roles SET name = ?2, color = ?3, permissions = ?4 WHERE id = ?1",
-            params![id, name, color, permissions as i64],
+            "UPDATE roles SET name = ?2, color = ?3, permissions = ?4, mentionable = ?5, hoisted = ?6 WHERE id = ?1",
+            params![id, name, color, permissions as i64, mentionable as i64, hoisted as i64],
         )?;
         Ok(changed > 0)
     }

@@ -600,15 +600,15 @@ where
                         }
                     }
 
-                    ClientMsg::CreateRole { name, color, permissions } => {
-                        let change = RoleChange::Create { name, color, permissions };
+                    ClientMsg::CreateRole { name, color, permissions, mentionable, hoisted } => {
+                        let change = RoleChange::Create { name, color, permissions, mentionable, hoisted };
                         if let Some(text) = change_roles(&state, &tx, &user, change)? {
                             send(&mut writer, &ServerMsg::Error { text }).await?;
                         }
                     }
 
-                    ClientMsg::UpdateRole { role, name, color, permissions } => {
-                        let change = RoleChange::Update { role, name, color, permissions };
+                    ClientMsg::UpdateRole { role, name, color, permissions, mentionable, hoisted } => {
+                        let change = RoleChange::Update { role, name, color, permissions, mentionable, hoisted };
                         if let Some(text) = change_roles(&state, &tx, &user, change)? {
                             send(&mut writer, &ServerMsg::Error { text }).await?;
                         }
@@ -1339,8 +1339,8 @@ fn may(state: &SharedState, user: &str, permission: u32) -> rusqlite::Result<boo
 
 /// A change to the roles, asked for by a member.
 enum RoleChange {
-    Create { name: String, color: String, permissions: u32 },
-    Update { role: i64, name: String, color: String, permissions: u32 },
+    Create { name: String, color: String, permissions: u32, mentionable: bool, hoisted: bool },
+    Update { role: i64, name: String, color: String, permissions: u32, mentionable: bool, hoisted: bool },
     Delete { role: i64 },
     Move { role: i64, before: Option<i64> },
     Member { user: String, role: i64, on: bool },
@@ -1376,19 +1376,21 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
     let below_you = "that role is not below your highest role";
     let no_role = "there is no such role";
     match change {
-        RoleChange::Create { name, color, permissions } => {
+        RoleChange::Create { name, color, permissions, mentionable, hoisted } => {
             let name = name.trim().to_string();
             if let Some(text) = role_fields_error(&power, &name, &color, permissions) {
                 return Ok(Err(text));
             }
-            match db.create_role(&name, &color, permissions)? {
+            match db.create_role(&name, &color, permissions, mentionable, hoisted)? {
                 Some(_) => Ok(Ok(())),
                 None => Ok(Err("a role with that name already exists".into())),
             }
         }
-        RoleChange::Update { role, name, color, permissions } => {
+        RoleChange::Update { role, name, color, permissions, mentionable, hoisted } => {
             // @everyone keeps its name.
             let name = if role == EVERYONE_ROLE { "@everyone".to_string() } else { name.trim().to_string() };
+            // @everyone already reaches everyone, so it cannot be pinged or grouped.
+            let (mentionable, hoisted) = if role == EVERYONE_ROLE { (false, false) } else { (mentionable, hoisted) };
             let Some(index) = index_of(role) else { return Ok(Err(no_role.into())) };
             if !power.outranks(index) {
                 return Ok(Err(below_you.into()));
@@ -1399,7 +1401,7 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
             if db.role_name_taken(&name, role)? {
                 return Ok(Err("a role with that name already exists".into()));
             }
-            db.update_role(role, &name, &color, permissions)?;
+            db.update_role(role, &name, &color, permissions, mentionable, hoisted)?;
             Ok(Ok(()))
         }
         RoleChange::Delete { role } => {
@@ -1531,10 +1533,10 @@ mod role_tests {
         db.add_member("carol", "Carol", 3).unwrap();
         db.add_member("dan", "Dan", 4).unwrap();
         let admin = db
-            .create_role("Admin", "", perm::MANAGE_ROLES | perm::MANAGE_CHANNELS)
+            .create_role("Admin", "", perm::MANAGE_ROLES | perm::MANAGE_CHANNELS, false, false)
             .unwrap()
             .unwrap();
-        let mods = db.create_role("Mods", "#00ff00", perm::MANAGE_MESSAGES).unwrap().unwrap();
+        let mods = db.create_role("Mods", "#00ff00", perm::MANAGE_MESSAGES, false, false).unwrap().unwrap();
         // Admin sits above Mods, as it does after creation order: Mods was created last, so is lowest.
         db.set_role_order(&[admin, mods]).unwrap();
         db.set_member_role("bob", admin, true).unwrap();
@@ -1543,12 +1545,35 @@ mod role_tests {
     }
 
     #[test]
+    fn ping_and_member_list_flags_are_saved_and_changed() {
+        let (db, _, _) = server();
+        let made = apply_role_change(
+            &db,
+            "owner",
+            RoleChange::Create { name: "Pingers".into(), color: String::new(), permissions: 0, mentionable: true, hoisted: true },
+        )
+        .unwrap();
+        assert!(made.is_ok());
+        let pingers = db.role_list().unwrap().into_iter().find(|r| r.name == "Pingers").unwrap();
+        assert!(pingers.mentionable && pingers.hoisted);
+        let off = apply_role_change(
+            &db,
+            "owner",
+            RoleChange::Update { role: pingers.id, name: "Pingers".into(), color: String::new(), permissions: 0, mentionable: false, hoisted: false },
+        )
+        .unwrap();
+        assert!(off.is_ok());
+        let pingers = db.role_list().unwrap().into_iter().find(|r| r.id == pingers.id).unwrap();
+        assert!(!pingers.mentionable && !pingers.hoisted);
+    }
+
+    #[test]
     fn owner_can_do_everything() {
         let (db, _, _) = server();
         let made = apply_role_change(
             &db,
             "owner",
-            RoleChange::Create { name: "Helpers".into(), color: "#123456".into(), permissions: perm::ALL },
+            RoleChange::Create { name: "Helpers".into(), color: "#123456".into(), permissions: perm::ALL , mentionable: false, hoisted: false },
         )
         .unwrap();
         assert_eq!(made, Ok(()));
@@ -1568,7 +1593,7 @@ mod role_tests {
         let refused = apply_role_change(
             &db,
             "carol",
-            RoleChange::Create { name: "X".into(), color: String::new(), permissions: 0 },
+            RoleChange::Create { name: "X".into(), color: String::new(), permissions: 0 , mentionable: false, hoisted: false },
         )
         .unwrap();
         assert!(refused.is_err());
@@ -1610,7 +1635,7 @@ mod role_tests {
         let refused = apply_role_change(
             &db,
             "bob",
-            RoleChange::Create { name: "Owners".into(), color: String::new(), permissions: perm::ALL },
+            RoleChange::Create { name: "Owners".into(), color: String::new(), permissions: perm::ALL , mentionable: false, hoisted: false },
         )
         .unwrap();
         // Bob has MANAGE_ROLES and MANAGE_CHANNELS, not MANAGE_MESSAGES.
@@ -1618,7 +1643,7 @@ mod role_tests {
         let fine = apply_role_change(
             &db,
             "bob",
-            RoleChange::Create { name: "Cleaners".into(), color: String::new(), permissions: perm::MANAGE_CHANNELS },
+            RoleChange::Create { name: "Cleaners".into(), color: String::new(), permissions: perm::MANAGE_CHANNELS , mentionable: false, hoisted: false },
         )
         .unwrap();
         assert_eq!(fine, Ok(()));
@@ -1630,14 +1655,14 @@ mod role_tests {
         let taken = apply_role_change(
             &db,
             "owner",
-            RoleChange::Create { name: "Mods".into(), color: String::new(), permissions: 0 },
+            RoleChange::Create { name: "Mods".into(), color: String::new(), permissions: 0 , mentionable: false, hoisted: false },
         )
         .unwrap();
         assert!(taken.is_err());
         let bad_colour = apply_role_change(
             &db,
             "owner",
-            RoleChange::Update { role: mods, name: "Mods".into(), color: "red".into(), permissions: 0 },
+            RoleChange::Update { role: mods, name: "Mods".into(), color: "red".into(), permissions: 0 , mentionable: false, hoisted: false },
         )
         .unwrap();
         assert!(bad_colour.is_err());
@@ -1709,7 +1734,7 @@ mod everyone_tests {
         let db = server();
         let order = db.role_list().unwrap();
         assert_eq!(order.last().map(|r| r.id), Some(EVERYONE_ROLE));
-        let mods = db.create_role("Mods", "", 0).unwrap().unwrap();
+        let mods = db.create_role("Mods", "", 0, false, false).unwrap().unwrap();
         assert_eq!(db.role_list().unwrap().last().map(|r| r.id), Some(EVERYONE_ROLE), "new roles go above @everyone");
         assert!(apply_role_change(&db, "owner", RoleChange::Delete { role: EVERYONE_ROLE }).unwrap().is_err());
         assert!(apply_role_change(&db, "owner", RoleChange::Move { role: EVERYONE_ROLE, before: None }).unwrap().is_err());
@@ -1725,7 +1750,7 @@ mod everyone_tests {
         let given = apply_role_change(
             &db,
             "owner",
-            RoleChange::Update { role: EVERYONE_ROLE, name: "x".into(), color: "#112233".into(), permissions: perm::MANAGE_MESSAGES },
+            RoleChange::Update { role: EVERYONE_ROLE, name: "x".into(), color: "#112233".into(), permissions: perm::MANAGE_MESSAGES , mentionable: false, hoisted: false },
         )
         .unwrap();
         assert_eq!(given, Ok(()));
