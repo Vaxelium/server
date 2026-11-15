@@ -265,6 +265,13 @@ impl Db {
         Ok(())
     }
 
+    /// When each member first joined this server, by id, in Unix seconds.
+    pub fn first_seen_all(&self) -> rusqlite::Result<std::collections::HashMap<String, u64>> {
+        let mut stmt = self.conn.prepare("SELECT name, first_seen FROM members")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?.max(0) as u64)))?;
+        rows.collect()
+    }
+
     /// The name to show for each member, by id.
     pub fn display_names(&self) -> rusqlite::Result<std::collections::HashMap<String, String>> {
         let mut stmt = self.conn.prepare(
