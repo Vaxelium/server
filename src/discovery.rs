@@ -20,6 +20,8 @@ const BEACON_PREFIX: &str = "VAXELIUM ";
 const BEACON_EVERY: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_FAILURES: u32 = 3;
+/// How long a peer that stopped answering stays out of the list after it is removed.
+pub const DEAD_PEER_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
 /// True for something that looks like `host:port` and is short enough to store.
 pub fn valid_addr(addr: &str) -> bool {
@@ -104,7 +106,7 @@ async fn exchange_with(state: SharedState, advertise: String, peer: String) {
             // The peer now has our address, so other servers know this one.
             let _ = s.db.mark_public();
             for addr in addrs {
-                if addr != advertise && valid_addr(&addr) {
+                if addr != advertise && valid_addr(&addr) && !s.recently_dead(&addr) {
                     let _ = s.db.add_peer(&addr);
                 }
             }
@@ -115,6 +117,7 @@ async fn exchange_with(state: SharedState, advertise: String, peer: String) {
             if *failures >= MAX_FAILURES {
                 s.peer_failures.remove(&peer);
                 let _ = s.db.remove_peer(&peer);
+                s.dead_peers.insert(peer.clone(), std::time::Instant::now());
             }
         }
     }

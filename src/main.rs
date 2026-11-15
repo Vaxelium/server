@@ -33,6 +33,16 @@ struct State {
     advertise: String,
     /// How many times in a row each known server has failed to answer.
     peer_failures: HashMap<String, u32>,
+    /// Peers removed for not answering, and when. Other servers keep listing them for a while, so
+    /// they are not added back from those lists until the cooldown has passed.
+    dead_peers: HashMap<String, std::time::Instant>,
+}
+
+impl State {
+    /// True while a peer removed for not answering is still in its cooldown.
+    fn recently_dead(&self, addr: &str) -> bool {
+        self.dead_peers.get(addr).is_some_and(|at| at.elapsed() < discovery::DEAD_PEER_COOLDOWN)
+    }
 }
 
 impl State {
@@ -198,6 +208,7 @@ async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         online: Vec::new(),
         advertise: advertise.clone(),
         peer_failures: HashMap::new(),
+        dead_peers: HashMap::new(),
     }));
     {
         let s = state.lock().unwrap();
@@ -946,6 +957,8 @@ fn public_info(state: &SharedState) -> ServerMsg {
         icon: s.db.server_icon().ok().flatten(),
         online: s.online.iter().collect::<std::collections::HashSet<_>>().len() as u32,
         public: s.db.is_public().unwrap_or(false),
+        // Every server makes its own certificate on first run (see `common::tls`).
+        self_signed: true,
     }
 }
 
@@ -958,7 +971,7 @@ fn share_peers(state: &SharedState, known: Vec<String>) -> Vec<String> {
         let _ = s.db.mark_public();
     }
     for addr in known {
-        if addr != s.advertise && discovery::valid_addr(&addr) {
+        if addr != s.advertise && discovery::valid_addr(&addr) && !s.recently_dead(&addr) {
             let _ = s.db.add_peer(&addr);
         }
     }
