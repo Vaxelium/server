@@ -58,6 +58,7 @@ impl State {
         let names = self.db.display_names().unwrap_or_default();
         let roles = self.db.all_member_roles().unwrap_or_default();
         let joined = self.db.first_seen_all().unwrap_or_default();
+        let statuses = self.db.statuses().unwrap_or_default();
         self.db
             .member_names()
             .unwrap_or_default()
@@ -68,7 +69,10 @@ impl State {
                 let name = names.get(&id).cloned().unwrap_or_else(|| id.clone());
                 let roles = roles.get(&id).cloned().unwrap_or_default();
                 let joined = joined.get(&id).copied().unwrap_or(0);
-                UserStatus { id, name, online, owner, roles, joined }
+                let status = statuses.get(&id).copied().unwrap_or_default();
+                // Invisible members are shown as offline, even while connected.
+                let online = online && status != common::PresenceStatus::Invisible;
+                UserStatus { id, name, online, owner, roles, joined, status }
             })
             .collect()
     }
@@ -822,6 +826,23 @@ where
                             }
                         }
                     }
+                    ClientMsg::SetStatus { status } => {
+                        let users = {
+                            let s = state.lock().unwrap();
+                            s.db.set_status(&user, status)?;
+                            s.presence()
+                        };
+                        let _ = tx.send(ServerMsg::Presence { users });
+                    }
+
+                    ClientMsg::Typing => {
+                        // Only the members who may view the channel hear about it.
+                        let viewable = channel_id != 0 && Access::new(&state.lock().unwrap().db, &user)?.allows(channel_id, perm::VIEW_CHANNEL);
+                        if viewable {
+                            let _ = tx.send(ServerMsg::Typing { channel_id, user: user.clone(), name: display.clone() });
+                        }
+                    }
+
                     ClientMsg::SetChannelOverride { channel, role, view, send: send_setting } => {
                         if !may(&state, &user, perm::MANAGE_CHANNELS)? {
                             send(&mut writer, &ServerMsg::Error { text: "you need the Manage channels permission for that".into() }).await?;
@@ -985,6 +1006,12 @@ where
                     Ok(ServerMsg::Reactions { channel_id: c, id, reactions }) if c == channel_id => {
                         if Access::new(&state.lock().unwrap().db, &user)?.allows(c, perm::VIEW_CHANNEL) {
                             send(&mut writer, &ServerMsg::Reactions { channel_id: c, id, reactions }).await?;
+                        }
+                    }
+                    Ok(ServerMsg::Typing { channel_id: c, user: who, name }) => {
+                        // Not to the person typing, and only in the channel this connection has open.
+                        if c == channel_id && who != user && Access::new(&state.lock().unwrap().db, &user)?.allows(c, perm::VIEW_CHANNEL) {
+                            send(&mut writer, &ServerMsg::Typing { channel_id: c, user: who, name }).await?;
                         }
                     }
                     Ok(overrides @ ServerMsg::ChannelOverrides { .. }) => {
@@ -2055,6 +2082,19 @@ mod everyone_tests {
         let order = db.role_list().unwrap();
         let power = power_of(&db, "erin", &order).unwrap();
         assert_eq!(power.grantable(), perm::ALL);
+    }
+
+    #[test]
+    fn status_is_saved_per_member() {
+        let db = server();
+        assert!(db.statuses().unwrap().is_empty());
+        db.set_status("bob", common::PresenceStatus::DoNotDisturb).unwrap();
+        db.set_status("bob", common::PresenceStatus::Idle).unwrap();
+        db.set_status("carol", common::PresenceStatus::Invisible).unwrap();
+        let statuses = db.statuses().unwrap();
+        assert_eq!(statuses.get("bob"), Some(&common::PresenceStatus::Idle));
+        assert_eq!(statuses.get("carol"), Some(&common::PresenceStatus::Invisible));
+        assert!(!statuses.contains_key("dan"));
     }
 
     #[test]

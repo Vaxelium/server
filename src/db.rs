@@ -73,6 +73,10 @@ CREATE TABLE IF NOT EXISTS direct_messages (
     b  TEXT NOT NULL,
     UNIQUE (a, b)
 );
+CREATE TABLE IF NOT EXISTS user_status (
+    user_id TEXT PRIMARY KEY,
+    status  TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS channel_overrides (
     channel_id INTEGER NOT NULL,
     role_id    INTEGER NOT NULL,
@@ -792,6 +796,21 @@ impl Db {
 
     /// Saves a message and returns its new id.
     /// Every role, highest first.
+    /// How each member has set their status, by account id. Members who never set one are not listed.
+    pub fn statuses(&self) -> rusqlite::Result<std::collections::HashMap<String, common::PresenceStatus>> {
+        let mut stmt = self.conn.prepare("SELECT user_id, status FROM user_status")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        rows.map(|r| r.map(|(id, key)| (id, common::PresenceStatus::from_key(&key)))).collect()
+    }
+
+    pub fn set_status(&self, user: &str, status: common::PresenceStatus) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO user_status (user_id, status) VALUES (?1, ?2)",
+            params![user, status.key()],
+        )?;
+        Ok(())
+    }
+
     /// The name of every channel, by id.
     pub fn channel_names(&self) -> rusqlite::Result<std::collections::HashMap<i64, String>> {
         let mut stmt = self.conn.prepare("SELECT id, name FROM channels")?;
