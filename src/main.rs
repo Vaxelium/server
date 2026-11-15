@@ -850,6 +850,10 @@ where
                             }
                         }
                     }
+                    ClientMsg::SetProfileStatus { text } => {
+                        let text: String = text.trim().chars().take(common::MAX_STATUS_TEXT_LEN).collect();
+                        let _ = tx.send(ServerMsg::ProfileStatus { user: user.clone(), text });
+                    }
                     ClientMsg::SetStatus { status } => {
                         let users = {
                             let s = state.lock().unwrap();
@@ -1043,6 +1047,9 @@ where
                     }
                     Ok(presence @ ServerMsg::Presence { .. }) => {
                         send(&mut writer, &presence).await?;
+                    }
+                    Ok(status @ ServerMsg::ProfileStatus { .. }) => {
+                        send(&mut writer, &status).await?;
                     }
                     Ok(roles @ ServerMsg::Roles { .. }) => {
                         send(&mut writer, &roles).await?;
