@@ -1044,6 +1044,8 @@ where
                     }
                     Ok(overrides @ ServerMsg::ChannelOverrides { .. }) => {
                         send(&mut writer, &overrides).await?;
+                        // What each member can see may have changed, so their channel list is sent again.
+                        send_visible_channels(&mut writer, &state, &user).await?;
                     }
                     Ok(presence @ ServerMsg::Presence { .. }) => {
                         send(&mut writer, &presence).await?;
@@ -1053,6 +1055,8 @@ where
                     }
                     Ok(roles @ ServerMsg::Roles { .. }) => {
                         send(&mut writer, &roles).await?;
+                        // Roles decide which channels a member can see, so their channel list is sent again.
+                        send_visible_channels(&mut writer, &state, &user).await?;
                     }
                     Ok(icon @ ServerMsg::ServerIcon { .. }) => {
                         send(&mut writer, &icon).await?;
@@ -1431,6 +1435,21 @@ impl Drop for OnlineGuard {
         };
         let _ = self.tx.send(ServerMsg::Presence { users });
     }
+}
+
+/// Sends a member the channels and categories they may view now. Sent again whenever permissions change,
+/// so an open client shows a channel as soon as it becomes visible, and hides one that is no longer.
+async fn send_visible_channels<W: AsyncWrite + Unpin>(writer: &mut W, state: &SharedState, user: &str) -> anyhow::Result<()> {
+    let (channels, categories, uncategorized) = {
+        let s = state.lock().unwrap();
+        let access = Access::new(&s.db, user)?;
+        let (categories, uncategorized) = visible_layout(&access, s.db.categories()?, s.db.uncategorized_channels()?);
+        let channels = s.db.channel_list()?.into_iter().filter(|c| access.allows(c.id, perm::VIEW_CHANNEL)).collect();
+        (channels, categories, uncategorized)
+    };
+    send(writer, &ServerMsg::Channels { channels }).await?;
+    send(writer, &ServerMsg::Categories { categories, uncategorized }).await?;
+    Ok(())
 }
 
 async fn send<W: AsyncWrite + Unpin>(writer: &mut W, msg: &ServerMsg) -> anyhow::Result<()> {
