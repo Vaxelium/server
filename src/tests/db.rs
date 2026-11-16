@@ -14,6 +14,7 @@ mod tests {
             edited: false,
             reactions: vec![],
             reply: None,
+            pinned: false,
         }
     }
 
@@ -33,6 +34,37 @@ mod tests {
         assert_eq!(db.delete_message(in_channel, "owner", true).unwrap(), Some(general));
         // The author can delete their own direct message.
         assert_eq!(db.delete_message(in_dm, "alice", false).unwrap(), Some(dm_id));
+    }
+
+    #[test]
+    fn pins_are_listed_and_capped() {
+        let db = Db::open(":memory:").unwrap();
+        let general = db.ensure_channel("general").unwrap();
+        let first = db.save_message(&message(&db, "general", "alice", "first")).unwrap();
+        let second = db.save_message(&message(&db, "general", "bob", "second")).unwrap();
+
+        assert_eq!(db.set_pinned(first, true, 10).unwrap(), Ok(Some(general)));
+        assert_eq!(db.set_pinned(second, true, 20).unwrap(), Ok(Some(general)));
+        let pins: Vec<i64> = db.pins(general).unwrap().iter().map(|m| m.id).collect();
+        assert_eq!(pins, vec![second, first], "the latest pin comes first");
+        assert!(db.history(general).unwrap().iter().all(|m| m.pinned));
+
+        // Pinning again keeps its place; unpinning takes it off the list.
+        db.set_pinned(first, true, 30).unwrap().unwrap();
+        assert_eq!(db.pins(general).unwrap()[0].id, second);
+        db.set_pinned(first, false, 40).unwrap().unwrap();
+        assert_eq!(db.pins(general).unwrap().len(), 1);
+        assert_eq!(db.set_pinned(9999, true, 50).unwrap(), Ok(None), "no such message");
+
+        // A full channel refuses another pin.
+        for i in 1..common::MAX_PINS {
+            let id = db
+                .save_message(&message(&db, "general", "alice", &format!("m{i}")))
+                .unwrap();
+            db.set_pinned(id, true, 100 + i as u64).unwrap().unwrap();
+        }
+        assert_eq!(db.pins(general).unwrap().len(), common::MAX_PINS);
+        assert_eq!(db.set_pinned(first, true, 999).unwrap(), Err(PinsFull));
     }
 
     #[test]
@@ -126,6 +158,7 @@ mod rename_tests {
             edited: false,
             reactions: Vec::new(),
             reply: None,
+            pinned: false,
         };
         db.save_message(&m).unwrap();
 
@@ -157,6 +190,7 @@ mod rename_tests {
             edited: false,
             reactions: Vec::new(),
             reply: None,
+            pinned: false,
         };
         db.save_message(&m).unwrap();
         assert!(db.delete_channel(general).unwrap());
@@ -287,6 +321,7 @@ mod member_id_tests {
             edited: false,
             reactions: Vec::new(),
             reply: None,
+            pinned: false,
         })
         .unwrap();
         assert!(db.legacy_ids().unwrap().contains(&"alice".to_string()));

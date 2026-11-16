@@ -276,6 +276,8 @@ impl Db {
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN channel_id INTEGER", []);
         // Messages made before replies lack this column; they answer nothing.
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN reply_to INTEGER", []);
+        // Messages made before pins lack this column; they are not pinned. Set to when it was pinned.
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN pinned_at INTEGER", []);
         // Channels made before they could be ordered lack this column; they keep their name order.
         let _ = conn.execute(
             "ALTER TABLE channels ADD COLUMN position INTEGER NOT NULL DEFAULT 0",
@@ -1576,18 +1578,69 @@ impl Db {
 
     /// The most recent `HISTORY_LEN` messages in a channel, oldest first.
     pub fn history(&self, channel: i64) -> rusqlite::Result<Vec<ChatMessage>> {
-        let name = self.channel_name(channel)?.unwrap_or_default();
-        // Each reply carries the message it answers. A deleted original is found as nothing.
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.channel_id, m.author, m.text, m.timestamp, m.edited, m.reply_to, r.author, r.text
-             FROM (
-                 SELECT id, channel_id, author, text, timestamp, edited, reply_to
-                 FROM messages WHERE channel_id = ?1 ORDER BY id DESC LIMIT ?2
-             ) AS m
+        self.load_messages(
+            "SELECT id, channel_id, author, text, timestamp, edited, reply_to, pinned_at
+             FROM messages WHERE channel_id = ?1 ORDER BY id DESC LIMIT ?2",
+            "m.id ASC",
+            params![channel, HISTORY_LEN],
+        )
+    }
+
+    /// A channel's pinned messages, the most recently pinned first.
+    pub fn pins(&self, channel: i64) -> rusqlite::Result<Vec<ChatMessage>> {
+        self.load_messages(
+            "SELECT id, channel_id, author, text, timestamp, edited, reply_to, pinned_at
+             FROM messages WHERE channel_id = ?1 AND pinned_at IS NOT NULL
+             ORDER BY pinned_at DESC, id DESC LIMIT ?2",
+            "m.pinned_at DESC, m.id DESC",
+            params![channel, common::MAX_PINS as i64],
+        )
+    }
+
+    /// Pins or unpins a message. Returns its channel, or None when there is no such message. A channel
+    /// that already has the most pins it can hold refuses another with `Err(PinsFull)`.
+    pub fn set_pinned(&self, id: i64, pinned: bool, now: u64) -> rusqlite::Result<Result<Option<i64>, PinsFull>> {
+        let Some(channel) = self.message_channel_id(id)? else {
+            return Ok(Ok(None));
+        };
+        if pinned {
+            let already: bool = self.conn.query_row(
+                "SELECT pinned_at IS NOT NULL FROM messages WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )?;
+            let count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE channel_id = ?1 AND pinned_at IS NOT NULL",
+                params![channel],
+                |r| r.get(0),
+            )?;
+            if !already && count as usize >= common::MAX_PINS {
+                return Ok(Err(PinsFull));
+            }
+            self.conn.execute(
+                "UPDATE messages SET pinned_at = COALESCE(pinned_at, ?2) WHERE id = ?1",
+                params![id, now as i64],
+            )?;
+        } else {
+            self.conn
+                .execute("UPDATE messages SET pinned_at = NULL WHERE id = ?1", params![id])?;
+        }
+        Ok(Ok(Some(channel)))
+    }
+
+    /// Messages from `sql`, which selects (id, channel_id, author, text, timestamp, edited, reply_to,
+    /// pinned_at) from messages in one channel, in the order `order` gives (over columns of `m`). Each comes with its author's name, its reactions, and
+    /// the message it replies to (a deleted original is found as nothing).
+    fn load_messages(&self, sql: &str, order: &str, args: impl rusqlite::Params) -> rusqlite::Result<Vec<ChatMessage>> {
+        let sql = format!(
+            "SELECT m.id, m.channel_id, m.author, m.text, m.timestamp, m.edited, m.reply_to, r.author, r.text,
+                    m.pinned_at IS NOT NULL
+             FROM ({sql}) AS m
              LEFT JOIN messages AS r ON r.id = m.reply_to
-             ORDER BY m.id ASC",
-        )?;
-        let rows = stmt.query_map(params![channel, HISTORY_LEN], |row| {
+             ORDER BY {order}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(args, |row| {
             let reply = row.get::<_, Option<i64>>(6)?.map(|id| -> rusqlite::Result<ReplyRef> {
                 Ok(ReplyRef {
                     id,
@@ -1603,7 +1656,7 @@ impl Db {
             Ok(ChatMessage {
                 id: row.get(0)?,
                 channel_id: row.get(1)?,
-                channel: name.clone(),
+                channel: String::new(),
                 author: row.get(2)?,
                 author_id: String::new(),
                 text: row.get(3)?,
@@ -1611,12 +1664,18 @@ impl Db {
                 edited: row.get::<_, i64>(5)? != 0,
                 reactions: Vec::new(),
                 reply: reply.transpose()?,
+                pinned: row.get(9)?,
             })
         })?;
         let mut messages: Vec<ChatMessage> = rows.collect::<rusqlite::Result<_>>()?;
         let names = self.display_names()?;
         let name_of = |id: &str| names.get(id).cloned().unwrap_or_else(|| id.to_string());
+        let channel_name = match messages.first() {
+            Some(m) => self.channel_name(m.channel_id)?.unwrap_or_default(),
+            None => String::new(),
+        };
         for m in &mut messages {
+            m.channel = channel_name.clone();
             m.author_id = m.author.clone();
             m.author = name_of(&m.author_id);
             if let Some(r) = m.reply.as_mut() {
@@ -1633,6 +1692,10 @@ impl Db {
         Ok(messages)
     }
 }
+
+/// A channel already has as many pinned messages as it can hold.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PinsFull;
 
 #[cfg(test)]
 #[path = "tests/db.rs"]

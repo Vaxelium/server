@@ -939,6 +939,7 @@ where
                             edited: false,
                             reactions: Vec::new(),
                             reply: None,
+                            pinned: false,
                         };
                         // A reply must answer a message in the same channel; anything else is sent plain.
                         if let Some(id) = reply_to {
@@ -1137,6 +1138,56 @@ where
                                 .await?;
                             }
                         }
+                    }
+                    ClientMsg::Pin { id, pinned } => {
+                        if !message_visible(&state, &user, id)? {
+                            send(&mut writer, &ServerMsg::Error { text: CANNOT_VIEW.into() }).await?;
+                            continue;
+                        }
+                        if cross_server_message(&state, id)? {
+                            send(&mut writer, &ServerMsg::Error { text: CROSS_SERVER_CHANGES.into() }).await?;
+                            continue;
+                        }
+                        // Either member of a direct message may pin in it; in a channel it takes Pin messages
+                        // (or Manage messages).
+                        let (channel, in_dm) = {
+                            let s = state.lock().unwrap();
+                            let name = s.db.message_channel(id)?.unwrap_or_default();
+                            (s.db.message_channel_id(id)?, name.starts_with("dm-"))
+                        };
+                        let Some(channel) = channel else { continue };
+                        let may_pin = in_dm
+                            || may_in_channel(&state, &user, channel, perm::PIN_MESSAGES)?
+                            || may_in_channel(&state, &user, channel, perm::MANAGE_MESSAGES)?;
+                        if !may_pin {
+                            send(&mut writer, &ServerMsg::Error {
+                                text: "you need the Pin messages permission to pin messages".into(),
+                            })
+                            .await?;
+                            continue;
+                        }
+                        let result = state.lock().unwrap().db.set_pinned(id, pinned, now_secs())?;
+                        match result {
+                            Ok(Some(channel_id)) => {
+                                let _ = tx.send(ServerMsg::MessagePinned { channel_id, id, pinned });
+                            }
+                            Ok(None) => {}
+                            Err(db::PinsFull) => {
+                                send(&mut writer, &ServerMsg::Error {
+                                    text: format!("a channel can have at most {} pinned messages", common::MAX_PINS),
+                                })
+                                .await?;
+                            }
+                        }
+                    }
+                    ClientMsg::ListPins { channel } => {
+                        let allowed = Access::new(&state.lock().unwrap().db, &user)?.allows(channel, perm::VIEW_CHANNEL);
+                        if !allowed {
+                            send(&mut writer, &ServerMsg::Error { text: CANNOT_VIEW.into() }).await?;
+                            continue;
+                        }
+                        let messages = state.lock().unwrap().db.pins(channel)?;
+                        send(&mut writer, &ServerMsg::Pins { channel_id: channel, messages }).await?;
                     }
                     ClientMsg::Edit { id, text } => {
                         if !message_visible(&state, &user, id)? {
@@ -1488,6 +1539,7 @@ async fn relay_receive(
             edited: false,
             reactions: Vec::new(),
             reply: None,
+            pinned: false,
         };
         message.id = s.db.save_message(&message).map_err(|e| e.to_string())?;
         message
