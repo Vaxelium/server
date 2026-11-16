@@ -903,7 +903,7 @@ where
                         }
                     }
 
-                    ClientMsg::Say { text } => {
+                    ClientMsg::Say { text, reply_to } => {
                         if channel_id == 0 {
                             send(&mut writer, &ServerMsg::Error { text: "join a channel first".into() }).await?;
                             continue;
@@ -938,7 +938,12 @@ where
                             timestamp: now_secs(),
                             edited: false,
                             reactions: Vec::new(),
+                            reply: None,
                         };
+                        // A reply must answer a message in the same channel; anything else is sent plain.
+                        if let Some(id) = reply_to {
+                            message.reply = state.lock().unwrap().db.reply_ref(id, channel_id)?;
+                        }
                         message.id = state.lock().unwrap().db.save_message(&message)?;
                         let text = message.text.clone();
                         let _ = tx.send(ServerMsg::Message { message });
@@ -1482,6 +1487,7 @@ async fn relay_receive(
             timestamp: now_secs(),
             edited: false,
             reactions: Vec::new(),
+            reply: None,
         };
         message.id = s.db.save_message(&message).map_err(|e| e.to_string())?;
         message

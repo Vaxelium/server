@@ -13,6 +13,7 @@ mod tests {
             timestamp: 1,
             edited: false,
             reactions: vec![],
+            reply: None,
         }
     }
 
@@ -32,6 +33,44 @@ mod tests {
         assert_eq!(db.delete_message(in_channel, "owner", true).unwrap(), Some(general));
         // The author can delete their own direct message.
         assert_eq!(db.delete_message(in_dm, "alice", false).unwrap(), Some(dm_id));
+    }
+
+    #[test]
+    fn replies_keep_their_original() {
+        let db = Db::open(":memory:").unwrap();
+        let general = db.ensure_channel("general").unwrap();
+        let other = db.ensure_channel("other").unwrap();
+        let original = db
+            .save_message(&message(&db, "general", "alice", "the\noriginal"))
+            .unwrap();
+
+        // A reply may only answer a message in its own channel.
+        assert!(db.reply_ref(original, other).unwrap().is_none());
+        let reply = db.reply_ref(original, general).unwrap().expect("same channel");
+        assert_eq!(reply.text, "the original", "the preview is on one line");
+
+        let mut answer = message(&db, "general", "bob", "answer");
+        answer.reply = Some(reply);
+        db.save_message(&answer).unwrap();
+        let history = db.history(general).unwrap();
+        let loaded = history.last().unwrap().reply.clone().expect("the reply is kept");
+        assert_eq!(
+            (loaded.id, loaded.author_id.as_str(), loaded.text.as_str()),
+            (original, "alice", "the original")
+        );
+
+        // Once the original is deleted, the reply still knows which message it answered, but not its text.
+        db.delete_message(original, "alice", false).unwrap();
+        let loaded = db
+            .history(general)
+            .unwrap()
+            .last()
+            .unwrap()
+            .reply
+            .clone()
+            .expect("still a reply");
+        assert_eq!(loaded.id, original);
+        assert!(loaded.author_id.is_empty() && loaded.text.is_empty());
     }
 }
 
@@ -86,6 +125,7 @@ mod rename_tests {
             timestamp: 1,
             edited: false,
             reactions: Vec::new(),
+            reply: None,
         };
         db.save_message(&m).unwrap();
 
@@ -116,6 +156,7 @@ mod rename_tests {
             timestamp: 1,
             edited: false,
             reactions: Vec::new(),
+            reply: None,
         };
         db.save_message(&m).unwrap();
         assert!(db.delete_channel(general).unwrap());
@@ -245,6 +286,7 @@ mod member_id_tests {
             timestamp: 1,
             edited: false,
             reactions: Vec::new(),
+            reply: None,
         })
         .unwrap();
         assert!(db.legacy_ids().unwrap().contains(&"alice".to_string()));

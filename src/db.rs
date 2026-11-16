@@ -1,7 +1,7 @@
 //! SQLite storage for channels and messages. Accounts live in the auth service.
 
-use common::ChatMessage;
-use rusqlite::{params, Connection};
+use common::{ChatMessage, ReplyRef};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// Messages sent to a user when they join a channel.
 pub const HISTORY_LEN: i64 = 200;
@@ -274,6 +274,8 @@ impl Db {
         let _ = conn.execute("ALTER TABLE session_cache ADD COLUMN id TEXT", []);
         // Messages made before they named their channel by ID lack this column.
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN channel_id INTEGER", []);
+        // Messages made before replies lack this column; they answer nothing.
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN reply_to INTEGER", []);
         // Channels made before they could be ordered lack this column; they keep their name order.
         let _ = conn.execute(
             "ALTER TABLE channels ADD COLUMN position INTEGER NOT NULL DEFAULT 0",
@@ -1421,11 +1423,45 @@ impl Db {
 
     pub fn save_message(&self, m: &ChatMessage) -> rusqlite::Result<i64> {
         self.conn.execute(
-            "INSERT INTO messages (channel, channel_id, author, text, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO messages (channel, channel_id, author, text, timestamp, reply_to)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             // Messages are stored under the author's id, so they stay with the account.
-            params![m.channel, m.channel_id, m.author_id, m.text, m.timestamp as i64],
+            params![
+                m.channel,
+                m.channel_id,
+                m.author_id,
+                m.text,
+                m.timestamp as i64,
+                m.reply.as_ref().map(|r| r.id)
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// What a reply to message `id` shows of it, when that message is in `channel`.
+    pub fn reply_ref(&self, id: i64, channel: i64) -> rusqlite::Result<Option<ReplyRef>> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT author, text FROM messages WHERE id = ?1 AND channel_id = ?2",
+                params![id, channel],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((author_id, text)) = found else {
+            return Ok(None);
+        };
+        let author = self
+            .display_names()?
+            .get(&author_id)
+            .cloned()
+            .unwrap_or_else(|| author_id.clone());
+        Ok(Some(ReplyRef {
+            id,
+            author,
+            author_id,
+            text: common::reply_preview(&text),
+        }))
     }
 
     /// Deletes a message if `requester` wrote it, or always when `any` is true (the server owner,
@@ -1541,13 +1577,29 @@ impl Db {
     /// The most recent `HISTORY_LEN` messages in a channel, oldest first.
     pub fn history(&self, channel: i64) -> rusqlite::Result<Vec<ChatMessage>> {
         let name = self.channel_name(channel)?.unwrap_or_default();
+        // Each reply carries the message it answers. A deleted original is found as nothing.
         let mut stmt = self.conn.prepare(
-            "SELECT id, channel_id, author, text, timestamp, edited FROM (
-                 SELECT id, channel_id, author, text, timestamp, edited
+            "SELECT m.id, m.channel_id, m.author, m.text, m.timestamp, m.edited, m.reply_to, r.author, r.text
+             FROM (
+                 SELECT id, channel_id, author, text, timestamp, edited, reply_to
                  FROM messages WHERE channel_id = ?1 ORDER BY id DESC LIMIT ?2
-             ) ORDER BY id ASC",
+             ) AS m
+             LEFT JOIN messages AS r ON r.id = m.reply_to
+             ORDER BY m.id ASC",
         )?;
         let rows = stmt.query_map(params![channel, HISTORY_LEN], |row| {
+            let reply = row.get::<_, Option<i64>>(6)?.map(|id| -> rusqlite::Result<ReplyRef> {
+                Ok(ReplyRef {
+                    id,
+                    author: String::new(),
+                    author_id: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    text: row
+                        .get::<_, Option<String>>(8)?
+                        .as_deref()
+                        .map(common::reply_preview)
+                        .unwrap_or_default(),
+                })
+            });
             Ok(ChatMessage {
                 id: row.get(0)?,
                 channel_id: row.get(1)?,
@@ -1558,13 +1610,20 @@ impl Db {
                 timestamp: row.get::<_, i64>(4)? as u64,
                 edited: row.get::<_, i64>(5)? != 0,
                 reactions: Vec::new(),
+                reply: reply.transpose()?,
             })
         })?;
         let mut messages: Vec<ChatMessage> = rows.collect::<rusqlite::Result<_>>()?;
         let names = self.display_names()?;
+        let name_of = |id: &str| names.get(id).cloned().unwrap_or_else(|| id.to_string());
         for m in &mut messages {
             m.author_id = m.author.clone();
-            m.author = names.get(&m.author_id).cloned().unwrap_or_else(|| m.author_id.clone());
+            m.author = name_of(&m.author_id);
+            if let Some(r) = m.reply.as_mut() {
+                if !r.author_id.is_empty() {
+                    r.author = name_of(&r.author_id);
+                }
+            }
         }
         let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
         let mut reactions = self.reactions_for(&ids)?;
