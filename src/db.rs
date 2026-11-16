@@ -1432,3 +1432,42 @@ mod resurrect_tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+
+    fn names(list: &[common::ChannelRef]) -> Vec<String> {
+        list.iter().map(|c| c.name.clone()).collect()
+    }
+
+    #[test]
+    fn a_channel_can_be_placed_before_another_or_at_the_end_of_a_category() {
+        let db = Db::open(":memory:").unwrap();
+        let a = db.ensure_channel("a").unwrap();
+        let b = db.ensure_channel("b").unwrap();
+        let c = db.ensure_channel("c").unwrap();
+        let cat = db.create_category("Group").unwrap().expect("made");
+        // Move c to the front of the uncategorized list, before a.
+        assert!(db.place_channel(c, None, Some(a)).unwrap());
+        assert_eq!(names(&db.uncategorized_channels().unwrap()), vec!["general", "random", "c", "a", "b"]);
+        // Put a into the category, at its end, then b before a.
+        assert!(db.place_channel(a, Some(cat), None).unwrap());
+        assert!(db.place_channel(b, Some(cat), Some(a)).unwrap());
+        let group = db.categories().unwrap().into_iter().find(|g| g.id == cat).unwrap();
+        assert_eq!(names(&group.channels), vec!["b", "a"]);
+        assert_eq!(names(&db.uncategorized_channels().unwrap()), vec!["general", "random", "c"]);
+    }
+
+    #[test]
+    fn a_channel_moved_to_a_category_goes_to_its_end() {
+        let db = Db::open(":memory:").unwrap();
+        let x = db.ensure_channel("x").unwrap();
+        let y = db.ensure_channel("y").unwrap();
+        let cat = db.create_category("Group").unwrap().expect("made");
+        db.move_channel(x, Some(cat)).unwrap();
+        db.move_channel(y, Some(cat)).unwrap();
+        let group = db.categories().unwrap().into_iter().find(|g| g.id == cat).unwrap();
+        assert_eq!(names(&group.channels), vec!["x", "y"]);
+    }
+}
