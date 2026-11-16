@@ -792,7 +792,7 @@ where
                                 s.db.set_server_icon(png_base64.as_deref())?;
                                 Ok(())
                             } else {
-                                Err("you need the Manage server permission to change this server")
+                                Err("you need the Manage Server permission to change this server")
                             }
                         };
                         match result {
@@ -828,7 +828,7 @@ where
                                 s.db.set_server_description(&description)?;
                                 Ok(())
                             } else {
-                                Err("you need the Manage server permission to change this server")
+                                Err("you need the Manage Server permission to change this server")
                             }
                         };
                         match result {
@@ -849,7 +849,7 @@ where
                         let exists = state.lock().unwrap().db.channel_id(&requested)?.is_some();
                         if !exists && !requested.starts_with("dm-") && !may(&state, &user, perm::MANAGE_CHANNELS)? {
                             send(&mut writer, &ServerMsg::Error {
-                                text: "you need the Manage channels permission to create a channel".into(),
+                                text: "you need the Manage Channels permission to create a channel".into(),
                             })
                             .await?;
                             continue;
@@ -977,7 +977,7 @@ where
 
                     ClientMsg::SetChannelOverride { channel, role, view, send: send_setting, manage_channels, manage_messages } => {
                         if !may_in_channel(&state, &user, channel, perm::MANAGE_CHANNELS)? {
-                            send(&mut writer, &ServerMsg::Error { text: "you need the Manage channels permission for that".into() }).await?;
+                            send(&mut writer, &ServerMsg::Error { text: "you need the Manage Channels permission for that".into() }).await?;
                             continue;
                         }
                         let result = {
@@ -1133,7 +1133,7 @@ where
                             }
                             None => {
                                 send(&mut writer, &ServerMsg::Error {
-                                    text: "only the author, or someone with Manage messages, can delete a message".into(),
+                                    text: "only the author, or someone with Manage Messages, can delete a message".into(),
                                 })
                                 .await?;
                             }
@@ -1161,7 +1161,7 @@ where
                             || may_in_channel(&state, &user, channel, perm::MANAGE_MESSAGES)?;
                         if !may_pin {
                             send(&mut writer, &ServerMsg::Error {
-                                text: "you need the Pin messages permission to pin messages".into(),
+                                text: "you need the Pin Messages permission to pin messages".into(),
                             })
                             .await?;
                             continue;
@@ -1746,8 +1746,8 @@ fn join_channel(
     Ok(Some((id, history)))
 }
 
-const NO_CHANNEL_PERMISSION: &str = "you need the Manage channels permission for that";
-const NO_CATEGORY_LEAVE: &str = "you need Manage channel in both categories to move a channel between them";
+const NO_CHANNEL_PERMISSION: &str = "you need the Manage Channels permission for that";
+const NO_CATEGORY_LEAVE: &str = "you need Manage Channel in both categories to move a channel between them";
 
 /// What an account may do, worked out from its roles.
 struct Power {
@@ -1988,7 +1988,7 @@ const CANNOT_SEND: &str = "you can't send messages in that channel";
 
 /// The permissions @everyone keeps until another role has them.
 const EVERYONE_KEEPS_BITS: u32 = perm::VIEW_CHANNEL | perm::SEND_MESSAGES;
-const EVERYONE_KEEPS: &str = "@everyone keeps View channels and Message channels until another role has them";
+const EVERYONE_KEEPS: &str = "@everyone keeps View Channels and Message Channels until another role has them";
 
 /// True when setting @everyone's permissions to `permissions` would drop one of the kept bits that no
 /// other role holds.
@@ -2065,7 +2065,7 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
     let order = db.role_list()?;
     let power = power_of(db, actor, &order)?;
     if !power.has(perm::MANAGE_ROLES) {
-        return Ok(Err("you need the Manage roles permission for that".into()));
+        return Ok(Err("you need the Manage Roles permission for that".into()));
     }
     let index_of = |id: i64| order.iter().position(|r| r.id == id);
     let below_you = "that role is not below your highest role";
@@ -2219,7 +2219,7 @@ fn change_badges(
     change: BadgeChange,
 ) -> rusqlite::Result<Option<String>> {
     if !may(state, user, perm::MANAGE_ROLES)? {
-        return Ok(Some("you need the Manage roles permission to change badges".into()));
+        return Ok(Some("you need the Manage Roles permission to change badges".into()));
     }
     let refused = {
         let s = state.lock().unwrap();
