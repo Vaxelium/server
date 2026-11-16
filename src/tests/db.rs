@@ -37,6 +37,46 @@ mod tests {
     }
 
     #[test]
+    fn automod_is_not_a_member() {
+        let db = Db::open(":memory:").unwrap();
+        db.save_message(&message(&db, "general", "alice", "hi")).unwrap();
+        db.save_message(&message(&db, "general", common::AUTOMOD_ID, "Flagged a name."))
+            .unwrap();
+        let members = db.member_names().unwrap();
+        assert!(members.contains(&"alice".to_string()));
+        assert!(
+            !members.contains(&common::AUTOMOD_ID.to_string()),
+            "AutoMod is part of the server"
+        );
+    }
+
+    #[test]
+    fn automod_rules_are_kept() {
+        let db = Db::open(":memory:").unwrap();
+        assert_eq!(
+            db.automod().unwrap(),
+            common::AutoMod::default(),
+            "nothing is switched on at first"
+        );
+        let rules = common::AutoMod {
+            blocked_words: vec!["bad".into()],
+            block_links: true,
+            spam_filter: true,
+            names: common::NameRule {
+                enabled: true,
+                words: vec!["*admin*".into()],
+                block_interactions: true,
+                send_alert: true,
+                allowed_roles: vec![2],
+                ..common::NameRule::default()
+            },
+            alert_channel: Some(3),
+        };
+        db.set_automod(&rules).unwrap();
+        assert_eq!(db.automod().unwrap(), rules);
+    }
+
+    #[test]
     fn pins_are_listed_and_capped() {
         let db = Db::open(":memory:").unwrap();
         let general = db.ensure_channel("general").unwrap();

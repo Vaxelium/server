@@ -35,6 +35,8 @@ struct State {
     /// Peers removed for not answering, and when. Other servers keep listing them for a while, so
     /// they are not added back from those lists until the cooldown has passed.
     dead_peers: HashMap<String, std::time::Instant>,
+    /// The (member, name) pairs AutoMod has already posted an alert about, so each is reported once.
+    name_alerts: std::collections::HashSet<(String, String)>,
 }
 
 impl State {
@@ -229,6 +231,7 @@ async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         advertise: advertise.clone(),
         peer_failures: HashMap::new(),
         dead_peers: HashMap::new(),
+        name_alerts: std::collections::HashSet::new(),
     }));
     {
         let s = state.lock().unwrap();
@@ -384,6 +387,8 @@ where
     // No channel is open until the client joins one. Joining creates a channel only when it is asked for by name.
     let mut channel = String::new();
     let mut channel_id: i64 = 0;
+    // When this connection's recent messages were sent, for the spam filter.
+    let mut recent_sends: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
     // Removes the user and broadcasts presence on every exit path, including errors.
     let _online = OnlineGuard {
         state: state.clone(),
@@ -904,6 +909,18 @@ where
                     }
 
                     ClientMsg::Say { text, reply_to } => {
+                        // A flagged name is reported, and refused if the rule blocks, only when its member
+                        // tries to send a message.
+                        if let Some(word) = name_flag(&state, &user, &display)? {
+                            if let Some(reason) = name_block(&state, &user, &display)? {
+                                let why = format!("their name matches `{word}`");
+                                // The name was the problem, not the message, so the message is left out.
+                                report_block(&state, &tx, &display, channel_id, "", &why)?;
+                                send(&mut writer, &ServerMsg::Error { text: reason }).await?;
+                                continue;
+                            }
+                            name_alert(&state, &tx, &user, &display, &word)?;
+                        }
                         if channel_id == 0 {
                             send(&mut writer, &ServerMsg::Error { text: "join a channel first".into() }).await?;
                             continue;
@@ -926,6 +943,11 @@ where
                                 text: format!("message longer than {MAX_TEXT_LEN} characters"),
                             })
                             .await?;
+                            continue;
+                        }
+                        if let Some(reason) = automod_refusal(&state, &user, channel_id, &text, Some(&mut recent_sends))? {
+                            report_block(&state, &tx, &display, channel_id, &text, &reason)?;
+                            send(&mut writer, &ServerMsg::Error { text: reason }).await?;
                             continue;
                         }
                         let mut message = ChatMessage {
@@ -1078,6 +1100,10 @@ where
                     }
 
                     ClientMsg::React { id, emoji } => {
+                        // Blocked without a notice: AutoMod only speaks up when a message is sent.
+                        if name_block(&state, &user, &display)?.is_some() {
+                            continue;
+                        }
                         if !message_visible(&state, &user, id)? {
                             send(&mut writer, &ServerMsg::Error { text: CANNOT_VIEW.into() }).await?;
                             continue;
@@ -1139,7 +1165,28 @@ where
                             }
                         }
                     }
+                    ClientMsg::GetAutoMod => {
+                        if !may(&state, &user, perm::MANAGE_SERVER)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_AUTOMOD_PERMISSION.into() }).await?;
+                            continue;
+                        }
+                        let rules = state.lock().unwrap().db.automod()?;
+                        send(&mut writer, &ServerMsg::AutoMod { rules }).await?;
+                    }
+                    ClientMsg::SetAutoMod { rules } => {
+                        if !may(&state, &user, perm::MANAGE_SERVER)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_AUTOMOD_PERMISSION.into() }).await?;
+                            continue;
+                        }
+                        let rules = rules.tidied();
+                        state.lock().unwrap().db.set_automod(&rules)?;
+                        send(&mut writer, &ServerMsg::AutoMod { rules }).await?;
+                    }
                     ClientMsg::Pin { id, pinned } => {
+                        // Blocked without a notice: AutoMod only speaks up when a message is sent.
+                        if name_block(&state, &user, &display)?.is_some() {
+                            continue;
+                        }
                         if !message_visible(&state, &user, id)? {
                             send(&mut writer, &ServerMsg::Error { text: CANNOT_VIEW.into() }).await?;
                             continue;
@@ -1190,6 +1237,13 @@ where
                         send(&mut writer, &ServerMsg::Pins { channel_id: channel, messages }).await?;
                     }
                     ClientMsg::Edit { id, text } => {
+                        if let Some(reason) = name_block(&state, &user, &display)? {
+                            let channel = state.lock().unwrap().db.message_channel_id(id)?.unwrap_or(0);
+                            let word = name_flag(&state, &user, &display)?.unwrap_or_default();
+                            report_block(&state, &tx, &display, channel, "", &format!("their name matches `{word}`"))?;
+                            send(&mut writer, &ServerMsg::Error { text: reason }).await?;
+                            continue;
+                        }
                         if !message_visible(&state, &user, id)? {
                             send(&mut writer, &ServerMsg::Error { text: CANNOT_VIEW.into() }).await?;
                             continue;
@@ -1207,6 +1261,12 @@ where
                                 text: format!("message longer than {MAX_TEXT_LEN} characters"),
                             })
                             .await?;
+                            continue;
+                        }
+                        let edit_channel = state.lock().unwrap().db.message_channel_id(id)?.unwrap_or(0);
+                        if let Some(reason) = automod_refusal(&state, &user, edit_channel, &text, None)? {
+                            report_block(&state, &tx, &display, edit_channel, &text, &reason)?;
+                            send(&mut writer, &ServerMsg::Error { text: reason }).await?;
                             continue;
                         }
                         let edited = state.lock().unwrap().db.edit_message(id, &user, &text)?;
@@ -1980,6 +2040,149 @@ fn message_visible(state: &SharedState, user: &str, id: i64) -> rusqlite::Result
         return Ok(false);
     };
     Ok(Access::new(&s.db, user)?.allows(channel_id, perm::VIEW_CHANNEL))
+}
+
+/// The listed word `display` matches under AutoMod's name rule, or None when the name is fine or the
+/// member is left alone: Administrator and Manage Server holders, and holders of an allowed role.
+fn name_flag(state: &SharedState, user: &str, display: &str) -> rusqlite::Result<Option<String>> {
+    let rules = state.lock().unwrap().db.automod()?.names;
+    let Some(word) = rules.flags(display).map(str::to_string) else {
+        return Ok(None);
+    };
+    if may(state, user, perm::MANAGE_SERVER)? {
+        return Ok(None);
+    }
+    let held = state.lock().unwrap().db.member_role_ids(user)?;
+    if held.iter().any(|r| rules.allowed_roles.contains(r)) {
+        return Ok(None);
+    }
+    Ok(Some(word))
+}
+
+/// Why a member may not interact because of their name, or None when they may.
+fn name_block(state: &SharedState, user: &str, display: &str) -> rusqlite::Result<Option<String>> {
+    let blocking = state.lock().unwrap().db.automod()?.names.block_interactions;
+    if !blocking || name_flag(state, user, display)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(
+        "AutoMod: your name is not allowed on this server. Change your display name to take part.".into(),
+    ))
+}
+
+/// Posts AutoMod's alert about a flagged name to its channel, once per member and name, when the name
+/// rule asks for alerts.
+fn name_alert(
+    state: &SharedState,
+    tx: &tokio::sync::broadcast::Sender<ServerMsg>,
+    user: &str,
+    display: &str,
+    word: &str,
+) -> rusqlite::Result<()> {
+    {
+        let mut s = state.lock().unwrap();
+        if !s.db.automod()?.names.send_alert || !s.name_alerts.insert((user.to_string(), display.to_string())) {
+            return Ok(());
+        }
+    }
+    automod_post(
+        state,
+        tx,
+        &format!("Flagged the name of **{display}** (matched `{word}`)."),
+    )
+}
+
+/// Reports to AutoMod's channel that it blocked `display` in `channel`: why, and what they tried to send.
+fn report_block(
+    state: &SharedState,
+    tx: &tokio::sync::broadcast::Sender<ServerMsg>,
+    display: &str,
+    channel: i64,
+    text: &str,
+    reason: &str,
+) -> rusqlite::Result<()> {
+    let place = state.lock().unwrap().db.channel_name(channel)?.unwrap_or_default();
+    let why = reason.strip_prefix("AutoMod: ").unwrap_or(reason);
+    let mut report = format!("Blocked a message from **{display}** in #{place}: {why}.");
+    let quoted: Vec<String> = text.trim().lines().map(|l| format!("> {l}")).collect();
+    if !quoted.is_empty() {
+        report.push_str("\n\n");
+        report.push_str(&quoted.join("\n"));
+    }
+    automod_post(state, tx, &report)
+}
+
+/// Posts a message from AutoMod to its channel, when it has one.
+fn automod_post(
+    state: &SharedState,
+    tx: &tokio::sync::broadcast::Sender<ServerMsg>,
+    text: &str,
+) -> rusqlite::Result<()> {
+    let message = {
+        let s = state.lock().unwrap();
+        let Some(channel_id) = s.db.automod()?.alert_channel else {
+            return Ok(());
+        };
+        let Some(channel) = s.db.channel_name(channel_id)? else {
+            return Ok(());
+        };
+        let mut message = ChatMessage {
+            id: 0,
+            channel_id,
+            channel,
+            author: "AutoMod".into(),
+            author_id: common::AUTOMOD_ID.into(),
+            text: text.to_string(),
+            timestamp: now_secs(),
+            edited: false,
+            reactions: Vec::new(),
+            reply: None,
+            pinned: false,
+        };
+        message.id = s.db.save_message(&message)?;
+        message
+    };
+    let _ = tx.send(ServerMsg::Message { message });
+    Ok(())
+}
+
+const NO_AUTOMOD_PERMISSION: &str = "you need the Manage Server permission to change AutoMod";
+
+/// Why the server's automatic moderation refuses `text` from `user` in `channel`, or None when it may
+/// go. Members who may manage messages there are not checked, nor are direct messages. When
+/// `recent_sends` is given, this is a new message and the spam filter counts it.
+fn automod_refusal(
+    state: &SharedState,
+    user: &str,
+    channel: i64,
+    text: &str,
+    recent_sends: Option<&mut std::collections::VecDeque<u64>>,
+) -> rusqlite::Result<Option<String>> {
+    let (rules, in_dm) = {
+        let s = state.lock().unwrap();
+        let name = s.db.channel_name(channel)?.unwrap_or_default();
+        (s.db.automod()?, name.starts_with("dm-"))
+    };
+    if in_dm || may_in_channel(state, user, channel, perm::MANAGE_MESSAGES)? {
+        return Ok(None);
+    }
+    if let Some(reason) = rules.check(text) {
+        return Ok(Some(reason));
+    }
+    if let Some(sends) = recent_sends {
+        let now = now_secs();
+        while sends
+            .front()
+            .is_some_and(|&t| now.saturating_sub(t) >= common::SPAM_WINDOW_SECS)
+        {
+            sends.pop_front();
+        }
+        if rules.spam_filter && sends.len() >= common::SPAM_LIMIT {
+            return Ok(Some("AutoMod: you are sending messages too quickly, slow down".into()));
+        }
+        sends.push_back(now);
+    }
+    Ok(None)
 }
 
 /// Says the channel cannot be used by this member, for the message that refuses them.

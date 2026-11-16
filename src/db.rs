@@ -566,6 +566,26 @@ impl Db {
         )
     }
 
+    /// The server's automatic moderation rules. A server that never set any has none switched on.
+    pub fn automod(&self) -> rusqlite::Result<common::AutoMod> {
+        let stored: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM server_info WHERE key = 'automod'", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        // Tidied, so rules saved in an older shape read as the current one.
+        Ok(stored
+            .and_then(|json| serde_json::from_str::<common::AutoMod>(&json).ok())
+            .unwrap_or_default()
+            .tidied())
+    }
+
+    pub fn set_automod(&self, rules: &common::AutoMod) -> rusqlite::Result<()> {
+        let json = serde_json::to_string(rules).unwrap_or_default();
+        self.set_server_info("automod", &json)
+    }
+
     /// The server icon as base64 PNG, or `None` when the server has no icon.
     pub fn server_icon(&self) -> rusqlite::Result<Option<String>> {
         let icon: String =
@@ -686,8 +706,9 @@ impl Db {
     pub fn member_names(&self) -> rusqlite::Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT name FROM members UNION SELECT author FROM messages ORDER BY 1")?;
-        let names = stmt.query_map([], |row| row.get(0))?;
+            .prepare("SELECT name FROM members UNION SELECT author FROM messages WHERE author != ?1 ORDER BY 1")?;
+        // AutoMod posts as part of the server; it is not a member.
+        let names = stmt.query_map(params![common::AUTOMOD_ID], |row| row.get(0))?;
         names.collect()
     }
 
@@ -1067,7 +1088,8 @@ impl Db {
             let mut stmt = self.conn.prepare(sql)?;
             for id in stmt.query_map([], |row| row.get::<_, String>(0))? {
                 let id = id?;
-                if is_legacy_id(&id) {
+                // AutoMod's id is the server's own, so it is never looked up.
+                if is_legacy_id(&id) && id != common::AUTOMOD_ID {
                     ids.insert(id);
                 }
             }
