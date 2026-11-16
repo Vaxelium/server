@@ -94,6 +94,27 @@ CREATE TABLE IF NOT EXISTS channel_overrides (
     send       INTEGER,
     PRIMARY KEY (channel_id, role_id)
 );
+CREATE TABLE IF NOT EXISTS channel_member_overrides (
+    channel_id INTEGER NOT NULL,
+    member_id  TEXT NOT NULL,
+    view       INTEGER,
+    send       INTEGER,
+    PRIMARY KEY (channel_id, member_id)
+);
+CREATE TABLE IF NOT EXISTS category_member_overrides (
+    category_id INTEGER NOT NULL,
+    member_id   TEXT NOT NULL,
+    view        INTEGER,
+    send        INTEGER,
+    PRIMARY KEY (category_id, member_id)
+);
+CREATE TABLE IF NOT EXISTS category_overrides (
+    category_id INTEGER NOT NULL,
+    role_id     INTEGER NOT NULL,
+    view        INTEGER,
+    send        INTEGER,
+    PRIMARY KEY (category_id, role_id)
+);
 ";
 
 pub struct Db {
@@ -623,6 +644,8 @@ impl Db {
     /// Removes a category. Its channels are kept and become uncategorized. Returns false when there
     /// was no such category.
     pub fn delete_category(&self, id: i64) -> rusqlite::Result<bool> {
+        self.conn.execute("DELETE FROM category_overrides WHERE category_id = ?1", params![id])?;
+        self.conn.execute("DELETE FROM category_member_overrides WHERE category_id = ?1", params![id])?;
         self.conn.execute("UPDATE channels SET category_id = NULL WHERE category_id = ?1", params![id])?;
         let removed = self.conn.execute("DELETE FROM categories WHERE id = ?1", params![id])?;
         Ok(removed > 0)
@@ -633,8 +656,10 @@ impl Db {
         Ok(count > 0)
     }
 
-    /// Puts a channel in a category, or takes it out with `None`.
+    /// Puts a channel in a category, or takes it out with `None`. A channel that joins a category
+    /// takes on the category's permissions.
     pub fn move_channel(&self, channel: i64, category: Option<i64>) -> rusqlite::Result<()> {
+        let before = self.channel_category(channel)?;
         // Moved channels go to the end of their new group.
         self.conn.execute(
             "UPDATE channels SET category_id = ?2,
@@ -642,6 +667,126 @@ impl Db {
              WHERE id = ?1",
             params![channel, category],
         )?;
+        self.sync_to_category(channel, before, category)
+    }
+
+    /// The category a channel is in, if any.
+    fn channel_category(&self, channel: i64) -> rusqlite::Result<Option<i64>> {
+        let found: Option<Option<i64>> = {
+            use rusqlite::OptionalExtension;
+            self.conn.query_row("SELECT category_id FROM channels WHERE id = ?1", params![channel], |row| row.get(0)).optional()?
+        };
+        Ok(found.flatten())
+    }
+
+    /// When a channel joins a category it takes the category's permissions in place of its own.
+    /// Moving within a category, or out of one, leaves them alone.
+    fn sync_to_category(&self, channel: i64, before: Option<i64>, after: Option<i64>) -> rusqlite::Result<()> {
+        if let Some(category) = after.filter(|c| before != Some(*c)) {
+            self.conn.execute("DELETE FROM channel_overrides WHERE channel_id = ?1", params![channel])?;
+            self.conn.execute(
+                "INSERT INTO channel_overrides (channel_id, role_id, view, send)
+                 SELECT ?1, role_id, view, send FROM category_overrides WHERE category_id = ?2",
+                params![channel, category],
+            )?;
+            self.conn.execute("DELETE FROM channel_member_overrides WHERE channel_id = ?1", params![channel])?;
+            self.conn.execute(
+                "INSERT INTO channel_member_overrides (channel_id, member_id, view, send)
+                 SELECT ?1, member_id, view, send FROM category_member_overrides WHERE category_id = ?2",
+                params![channel, category],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Every category's permissions for roles.
+    pub fn category_overrides(&self) -> rusqlite::Result<Vec<common::CategoryOverride>> {
+        let mut stmt = self.conn.prepare("SELECT category_id, role_id, view, send FROM category_overrides ORDER BY category_id, role_id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(common::CategoryOverride {
+                category_id: row.get(0)?,
+                role: row.get(1)?,
+                view: row.get::<_, Option<i64>>(2)?.map(|v| v != 0),
+                send: row.get::<_, Option<i64>>(3)?.map(|v| v != 0),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Every channel's permissions for members.
+    pub fn channel_member_overrides(&self) -> rusqlite::Result<Vec<common::MemberChannelOverride>> {
+        let mut stmt = self.conn.prepare("SELECT channel_id, member_id, view, send FROM channel_member_overrides ORDER BY channel_id, member_id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(common::MemberChannelOverride {
+                channel_id: row.get(0)?,
+                member: row.get(1)?,
+                view: row.get::<_, Option<i64>>(2)?.map(|v| v != 0),
+                send: row.get::<_, Option<i64>>(3)?.map(|v| v != 0),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Every category's permissions for members.
+    pub fn category_member_overrides(&self) -> rusqlite::Result<Vec<common::MemberCategoryOverride>> {
+        let mut stmt = self.conn.prepare("SELECT category_id, member_id, view, send FROM category_member_overrides ORDER BY category_id, member_id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(common::MemberCategoryOverride {
+                category_id: row.get(0)?,
+                member: row.get(1)?,
+                view: row.get::<_, Option<i64>>(2)?.map(|v| v != 0),
+                send: row.get::<_, Option<i64>>(3)?.map(|v| v != 0),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Sets a member's permission for a channel. Both `None` removes it.
+    pub fn set_channel_member_override(&self, channel_id: i64, member: &str, view: Option<bool>, send: Option<bool>) -> rusqlite::Result<()> {
+        if view.is_none() && send.is_none() {
+            self.conn.execute("DELETE FROM channel_member_overrides WHERE channel_id = ?1 AND member_id = ?2", params![channel_id, member])?;
+        } else {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO channel_member_overrides (channel_id, member_id, view, send) VALUES (?1, ?2, ?3, ?4)",
+                params![channel_id, member, view.map(i64::from), send.map(i64::from)],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Sets a member's permission for a category and for each channel in it. Both `None` removes it.
+    pub fn set_category_member_override(&self, category: i64, member: &str, view: Option<bool>, send: Option<bool>) -> rusqlite::Result<()> {
+        if view.is_none() && send.is_none() {
+            self.conn.execute("DELETE FROM category_member_overrides WHERE category_id = ?1 AND member_id = ?2", params![category, member])?;
+        } else {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO category_member_overrides (category_id, member_id, view, send) VALUES (?1, ?2, ?3, ?4)",
+                params![category, member, view.map(i64::from), send.map(i64::from)],
+            )?;
+        }
+        let mut stmt = self.conn.prepare("SELECT id FROM channels WHERE category_id = ?1")?;
+        let channels: Vec<i64> = stmt.query_map(params![category], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+        for channel in channels {
+            self.set_channel_member_override(channel, member, view, send)?;
+        }
+        Ok(())
+    }
+
+    /// Sets a role's permission for a category and for each channel in it. Both `None` removes it.
+    pub fn set_category_override(&self, category: i64, role: i64, view: Option<bool>, send: Option<bool>) -> rusqlite::Result<()> {
+        if view.is_none() && send.is_none() {
+            self.conn.execute("DELETE FROM category_overrides WHERE category_id = ?1 AND role_id = ?2", params![category, role])?;
+        } else {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO category_overrides (category_id, role_id, view, send) VALUES (?1, ?2, ?3, ?4)",
+                params![category, role, view.map(i64::from), send.map(i64::from)],
+            )?;
+        }
+        let mut stmt = self.conn.prepare("SELECT id FROM channels WHERE category_id = ?1")?;
+        let channels: Vec<i64> = stmt.query_map(params![category], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+        for channel in channels {
+            self.set_channel_override(channel, role, view, send)?;
+        }
         Ok(())
     }
 
@@ -657,7 +802,9 @@ impl Db {
         if exists.is_none() {
             return Ok(false);
         }
+        let previous = self.channel_category(channel)?;
         self.conn.execute("UPDATE channels SET category_id = ?2 WHERE id = ?1", params![channel, category])?;
+        self.sync_to_category(channel, previous, category)?;
         let mut stmt = self.conn.prepare(
             "SELECT id FROM channels WHERE category_id IS ?1 AND id != ?2 ORDER BY position, name",
         )?;
@@ -786,6 +933,20 @@ impl Db {
             return Ok(false);
         }
         let changed = self.conn.execute("UPDATE channels SET name = ?2 WHERE id = ?1", params![id, new])?;
+        Ok(changed > 0)
+    }
+
+    /// Renames a category. Returns false when the new name is taken or there is no such category.
+    pub fn rename_category(&self, id: i64, new: &str) -> rusqlite::Result<bool> {
+        let taken: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM categories WHERE name = ?1 AND id != ?2",
+            params![new, id],
+            |row| row.get(0),
+        )?;
+        if taken > 0 {
+            return Ok(false);
+        }
+        let changed = self.conn.execute("UPDATE categories SET name = ?2 WHERE id = ?1", params![id, new])?;
         Ok(changed > 0)
     }
 
@@ -1434,6 +1595,59 @@ mod resurrect_tests {
 }
 
 #[cfg(test)]
+mod category_permission_tests {
+    use super::*;
+
+    fn everyone_view(db: &Db, channel: i64) -> Option<Option<bool>> {
+        db.channel_overrides().unwrap().into_iter().find(|o| o.channel_id == channel && o.role == common::EVERYONE_ROLE).map(|o| o.view)
+    }
+
+    #[test]
+    fn setting_a_category_permission_sets_it_on_every_channel_in_the_category() {
+        let db = Db::open(":memory:").unwrap();
+        let a = db.ensure_channel("a").unwrap();
+        let b = db.ensure_channel("b").unwrap();
+        let cat = db.create_category("Group").unwrap().expect("made");
+        db.move_channel(a, Some(cat)).unwrap();
+        db.move_channel(b, Some(cat)).unwrap();
+        db.set_category_override(cat, common::EVERYONE_ROLE, Some(false), None).unwrap();
+        assert_eq!(everyone_view(&db, a), Some(Some(false)));
+        assert_eq!(everyone_view(&db, b), Some(Some(false)));
+        assert_eq!(db.category_overrides().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_channel_moved_into_a_category_takes_its_permissions_and_keeps_them_when_moved_out() {
+        let db = Db::open(":memory:").unwrap();
+        let c = db.ensure_channel("c").unwrap();
+        db.set_channel_override(c, common::EVERYONE_ROLE, None, Some(true)).unwrap();
+        let cat = db.create_category("Group").unwrap().expect("made");
+        db.set_category_override(cat, common::EVERYONE_ROLE, Some(false), None).unwrap();
+        db.move_channel(c, Some(cat)).unwrap();
+        let mine: Vec<common::ChannelOverride> = db.channel_overrides().unwrap().into_iter().filter(|o| o.channel_id == c).collect();
+        assert_eq!(
+            mine,
+            vec![common::ChannelOverride { channel_id: c, role: common::EVERYONE_ROLE, view: Some(false), send: None }],
+            "the channel's own setting is replaced by the category's"
+        );
+        db.move_channel(c, None).unwrap();
+        assert_eq!(everyone_view(&db, c), Some(Some(false)), "leaving the category keeps the copied setting");
+    }
+
+    #[test]
+    fn clearing_a_category_permission_clears_it_on_its_channels() {
+        let db = Db::open(":memory:").unwrap();
+        let a = db.ensure_channel("a").unwrap();
+        let cat = db.create_category("Group").unwrap().expect("made");
+        db.move_channel(a, Some(cat)).unwrap();
+        db.set_category_override(cat, common::EVERYONE_ROLE, Some(false), None).unwrap();
+        db.set_category_override(cat, common::EVERYONE_ROLE, None, None).unwrap();
+        assert!(db.category_overrides().unwrap().is_empty());
+        assert_eq!(everyone_view(&db, a), None);
+    }
+}
+
+#[cfg(test)]
 mod ordering_tests {
     use super::*;
 
@@ -1457,6 +1671,18 @@ mod ordering_tests {
         let group = db.categories().unwrap().into_iter().find(|g| g.id == cat).unwrap();
         assert_eq!(names(&group.channels), vec!["b", "a"]);
         assert_eq!(names(&db.uncategorized_channels().unwrap()), vec!["general", "random", "c"]);
+    }
+
+    #[test]
+    fn a_category_can_be_renamed_but_not_to_a_taken_name() {
+        let db = Db::open(":memory:").unwrap();
+        let cat = db.create_category("Group").unwrap().expect("made");
+        db.create_category("Other").unwrap().expect("made");
+        assert!(!db.rename_category(cat, "Other").unwrap(), "the name is taken");
+        assert!(!db.rename_category(9999, "Missing").unwrap(), "there is no such category");
+        assert!(db.rename_category(cat, "Renamed").unwrap());
+        let names: Vec<String> = db.categories().unwrap().into_iter().map(|c| c.name).collect();
+        assert!(names.contains(&"Renamed".to_string()) && !names.contains(&"Group".to_string()));
     }
 
     #[test]

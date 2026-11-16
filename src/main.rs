@@ -371,6 +371,13 @@ where
     send(&mut writer, &ServerMsg::Badges { badges }).await?;
     let overrides = state.lock().unwrap().db.channel_overrides()?;
     send(&mut writer, &ServerMsg::ChannelOverrides { overrides }).await?;
+    let overrides = state.lock().unwrap().db.category_overrides()?;
+    send(&mut writer, &ServerMsg::CategoryOverrides { overrides }).await?;
+    let (channels, categories) = {
+        let s = state.lock().unwrap();
+        (s.db.channel_member_overrides()?, s.db.category_member_overrides()?)
+    };
+    send(&mut writer, &ServerMsg::MemberOverrides { channels, categories }).await?;
     {
         // Lets others message this account from another server. Does not hold up the welcome.
         let own = state.lock().unwrap().advertise.clone();
@@ -527,6 +534,30 @@ where
                         }
                     }
 
+                    ClientMsg::RenameCategory { category, new_name } => {
+                        if !may(&state, &user, perm::MANAGE_CHANNELS)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_CHANNEL_PERMISSION.into() }).await?;
+                            continue;
+                        }
+                        let name = new_name.trim().to_string();
+                        if name.is_empty() || name.chars().count() > MAX_CATEGORY_NAME_LEN {
+                            send(&mut writer, &ServerMsg::Error {
+                                text: format!("category name must be 1-{MAX_CATEGORY_NAME_LEN} characters"),
+                            })
+                            .await?;
+                            continue;
+                        }
+                        let renamed = state.lock().unwrap().db.rename_category(category, &name)?;
+                        if renamed {
+                            broadcast_categories(&state, &tx)?;
+                        } else {
+                            send(&mut writer, &ServerMsg::Error {
+                                text: "that category cannot be renamed to that name".into(),
+                            })
+                            .await?;
+                        }
+                    }
+
                     ClientMsg::RenameChannel { channel: id, new_name } => {
                         if !may(&state, &user, perm::MANAGE_CHANNELS)? {
                             send(&mut writer, &ServerMsg::Error { text: NO_CHANNEL_PERMISSION.into() }).await?;
@@ -597,6 +628,9 @@ where
                         }
                         state.lock().unwrap().db.place_channel(id, category, before)?;
                         broadcast_categories(&state, &tx)?;
+                        let overrides = state.lock().unwrap().db.channel_overrides()?;
+                        let _ = tx.send(ServerMsg::ChannelOverrides { overrides });
+                        send_member_overrides(&state, &tx)?;
                     }
 
                     ClientMsg::MoveChannel { channel: id, category } => {
@@ -621,7 +655,12 @@ where
                             }
                         };
                         match moved {
-                            Ok(()) => broadcast_categories(&state, &tx)?,
+                            Ok(()) => {
+                                broadcast_categories(&state, &tx)?;
+                                let overrides = state.lock().unwrap().db.channel_overrides()?;
+                                let _ = tx.send(ServerMsg::ChannelOverrides { overrides });
+                                send_member_overrides(&state, &tx)?;
+                            }
                             Err(text) => send(&mut writer, &ServerMsg::Error { text: text.into() }).await?,
                         }
                     }
@@ -898,6 +937,81 @@ where
                         }
                     }
 
+                    ClientMsg::SetCategoryMemberOverride { category, member, view, send: send_setting } => {
+                        if !may(&state, &user, perm::MANAGE_CHANNELS)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_CHANNEL_PERMISSION.into() }).await?;
+                            continue;
+                        }
+                        let result: Result<(Vec<common::MemberChannelOverride>, Vec<common::MemberCategoryOverride>), String> = {
+                            let s = state.lock().unwrap();
+                            if !s.db.category_exists(category)? {
+                                Err("there is no such category".to_string())
+                            } else if !s.db.is_member(&member)? {
+                                Err("there is no such member".to_string())
+                            } else {
+                                s.db.set_category_member_override(category, &member, view, send_setting)?;
+                                Ok((s.db.channel_member_overrides()?, s.db.category_member_overrides()?))
+                            }
+                        };
+                        match result {
+                            Ok((channels, categories)) => {
+                                let _ = tx.send(ServerMsg::MemberOverrides { channels, categories });
+                            }
+                            Err(text) => send(&mut writer, &ServerMsg::Error { text }).await?,
+                        }
+                    }
+
+                    ClientMsg::SetChannelMemberOverride { channel, member, view, send: send_setting } => {
+                        if !may(&state, &user, perm::MANAGE_CHANNELS)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_CHANNEL_PERMISSION.into() }).await?;
+                            continue;
+                        }
+                        let result: Result<(Vec<common::MemberChannelOverride>, Vec<common::MemberCategoryOverride>), String> = {
+                            let s = state.lock().unwrap();
+                            match s.db.channel_name(channel)? {
+                                None => Err("there is no such channel".to_string()),
+                                Some(name) if name.starts_with("dm-") => Err("direct messages can't have channel permissions".to_string()),
+                                Some(_) if !s.db.is_member(&member)? => Err("there is no such member".to_string()),
+                                Some(_) => {
+                                    s.db.set_channel_member_override(channel, &member, view, send_setting)?;
+                                    Ok((s.db.channel_member_overrides()?, s.db.category_member_overrides()?))
+                                }
+                            }
+                        };
+                        match result {
+                            Ok((channels, categories)) => {
+                                let _ = tx.send(ServerMsg::MemberOverrides { channels, categories });
+                            }
+                            Err(text) => send(&mut writer, &ServerMsg::Error { text }).await?,
+                        }
+                    }
+
+                    ClientMsg::SetCategoryOverride { category, role, view, send: send_setting } => {
+                        if !may(&state, &user, perm::MANAGE_CHANNELS)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_CHANNEL_PERMISSION.into() }).await?;
+                            continue;
+                        }
+                        let result: Result<(Vec<common::CategoryOverride>, Vec<common::ChannelOverride>), String> = {
+                            let s = state.lock().unwrap();
+                            if !s.db.category_exists(category)? {
+                                Err("there is no such category".to_string())
+                            } else if role != EVERYONE_ROLE && !s.db.role_list()?.iter().any(|r| r.id == role) {
+                                Err("there is no such role".to_string())
+                            } else {
+                                s.db.set_category_override(category, role, view, send_setting)?;
+                                Ok((s.db.category_overrides()?, s.db.channel_overrides()?))
+                            }
+                        };
+                        match result {
+                            Ok((categories, channels)) => {
+                                // The channels in the category changed too, so their overrides are sent with it.
+                                let _ = tx.send(ServerMsg::ChannelOverrides { overrides: channels });
+                                let _ = tx.send(ServerMsg::CategoryOverrides { overrides: categories });
+                            }
+                            Err(text) => send(&mut writer, &ServerMsg::Error { text }).await?,
+                        }
+                    }
+
                     ClientMsg::React { id, emoji } => {
                         if !message_visible(&state, &user, id)? {
                             send(&mut writer, &ServerMsg::Error { text: CANNOT_VIEW.into() }).await?;
@@ -1045,6 +1159,14 @@ where
                     Ok(overrides @ ServerMsg::ChannelOverrides { .. }) => {
                         send(&mut writer, &overrides).await?;
                         // What each member can see may have changed, so their channel list is sent again.
+                        send_visible_channels(&mut writer, &state, &user).await?;
+                    }
+                    Ok(overrides @ ServerMsg::CategoryOverrides { .. }) => {
+                        send(&mut writer, &overrides).await?;
+                    }
+                    Ok(overrides @ ServerMsg::MemberOverrides { .. }) => {
+                        send(&mut writer, &overrides).await?;
+                        // Which channels a member may see may have changed, so their channel list is sent again.
                         send_visible_channels(&mut writer, &state, &user).await?;
                     }
                     Ok(presence @ ServerMsg::Presence { .. }) => {
@@ -1538,9 +1660,13 @@ fn may(state: &SharedState, user: &str, permission: u32) -> rusqlite::Result<boo
 /// denial from any of the member's roles wins over an allowance.
 struct Access {
     power: Power,
+    /// The member's account id.
+    user: String,
     /// The roles the member holds, @everyone included.
     held: Vec<i64>,
     overrides: Vec<common::ChannelOverride>,
+    /// The permissions set for members, for every member. Only this member's are used.
+    member_overrides: Vec<common::MemberChannelOverride>,
     /// The name of each channel, by id. Direct messages are told apart by their name.
     names: std::collections::HashMap<i64, String>,
 }
@@ -1551,7 +1677,14 @@ impl Access {
         let power = power_of(db, user, &order)?;
         let mut held = db.member_role_ids(user)?;
         held.push(EVERYONE_ROLE);
-        Ok(Access { power, held, overrides: db.channel_overrides()?, names: db.channel_names()? })
+        Ok(Access {
+            power,
+            user: user.to_string(),
+            held,
+            overrides: db.channel_overrides()?,
+            member_overrides: db.channel_member_overrides()?,
+            names: db.channel_names()?,
+        })
     }
 
     /// Whether the member may view (`VIEW_CHANNEL`) or send in (`SEND_MESSAGES`) a channel. Direct
@@ -1564,6 +1697,13 @@ impl Access {
         }
         if self.power.has(perm::MANAGE_CHANNELS) {
             return true;
+        }
+        // A setting for this member beats the settings of their roles.
+        if let Some(mine) = self.member_overrides.iter().find(|o| o.channel_id == channel_id && o.member == self.user) {
+            let setting = if bit == perm::VIEW_CHANNEL { mine.view } else { mine.send };
+            if let Some(allowed) = setting {
+                return allowed;
+            }
         }
         let mut allowed = false;
         for o in self.overrides.iter().filter(|o| o.channel_id == channel_id && self.held.contains(&o.role)) {
@@ -1848,6 +1988,16 @@ fn change_roles(
     }
 }
 
+/// Sends every member's permissions for channels and categories to everyone connected.
+fn send_member_overrides(state: &Arc<Mutex<State>>, tx: &broadcast::Sender<ServerMsg>) -> Result<(), rusqlite::Error> {
+    let (channels, categories) = {
+        let s = state.lock().unwrap();
+        (s.db.channel_member_overrides()?, s.db.category_member_overrides()?)
+    };
+    let _ = tx.send(ServerMsg::MemberOverrides { channels, categories });
+    Ok(())
+}
+
 /// Sends the current categories to every connection.
 fn broadcast_categories(state: &Arc<Mutex<State>>, tx: &broadcast::Sender<ServerMsg>) -> Result<(), rusqlite::Error> {
     let (categories, uncategorized) = {
@@ -2119,6 +2269,49 @@ mod role_tests {
         .unwrap();
         assert_eq!(given, Ok(()));
         assert_eq!(db.member_role_ids("owner").unwrap(), vec![admin]);
+    }
+}
+
+#[cfg(test)]
+mod member_override_tests {
+    use super::*;
+
+    fn server() -> Db {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("carol", "Carol", 2).unwrap();
+        db
+    }
+
+    #[test]
+    fn a_members_setting_beats_their_roles_setting_for_that_channel() {
+        let db = server();
+        let general = db.ensure_channel("general").unwrap();
+        // Everyone may view the channel, but carol is denied it herself.
+        db.set_channel_override(general, EVERYONE_ROLE, Some(true), None).unwrap();
+        assert!(Access::new(&db, "carol").unwrap().allows(general, perm::VIEW_CHANNEL));
+        db.set_channel_member_override(general, "carol", Some(false), None).unwrap();
+        assert!(!Access::new(&db, "carol").unwrap().allows(general, perm::VIEW_CHANNEL), "carol's own denial wins");
+        assert!(Access::new(&db, "owner").unwrap().allows(general, perm::VIEW_CHANNEL), "other members are not affected");
+        // A member's allowance wins over a role's denial too.
+        db.set_channel_override(general, EVERYONE_ROLE, Some(false), None).unwrap();
+        db.set_channel_member_override(general, "carol", Some(true), None).unwrap();
+        assert!(Access::new(&db, "carol").unwrap().allows(general, perm::VIEW_CHANNEL));
+    }
+
+    #[test]
+    fn a_category_member_setting_reaches_its_channels_and_moved_in_channels() {
+        let db = server();
+        let a = db.ensure_channel("a").unwrap();
+        let cat = db.create_category("Group").unwrap().expect("made");
+        db.move_channel(a, Some(cat)).unwrap();
+        db.set_category_member_override(cat, "carol", Some(false), None).unwrap();
+        assert!(!Access::new(&db, "carol").unwrap().allows(a, perm::VIEW_CHANNEL));
+        // A channel moved into the category takes the member settings too.
+        let b = db.ensure_channel("b").unwrap();
+        db.move_channel(b, Some(cat)).unwrap();
+        assert!(!Access::new(&db, "carol").unwrap().allows(b, perm::VIEW_CHANNEL));
+        assert_eq!(db.category_member_overrides().unwrap().len(), 1);
     }
 }
 
