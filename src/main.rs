@@ -1,5 +1,6 @@
 mod db;
 mod discovery;
+mod web;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
@@ -103,6 +104,8 @@ struct ServerConfig {
     discovery_port: u16,
     exchange_secs: u64,
     peers: Vec<String>,
+    /// Where to serve the web client, if this server serves it.
+    web_addr: Option<String>,
 }
 
 /// Usage: `server [ADDR] [DB_PATH] [AUTH_ADDR] [COUNT]`
@@ -191,6 +194,18 @@ async fn run() -> anyhow::Result<()> {
             } else {
                 Vec::new()
             },
+            // The first server of a group serves the web client: on VAXELIUM_WEB_ADDR (host:port, or
+            // "off"), or by default on the first port past the group, which is 7880 for one server on 7878.
+            web_addr: if i == 0 {
+                let default = port.checked_add(count + 1).map(|p| format!("{host}:{p}"));
+                match std::env::var("VAXELIUM_WEB_ADDR") {
+                    Ok(v) if v.eq_ignore_ascii_case("off") => None,
+                    Ok(v) => Some(v),
+                    Err(_) => default,
+                }
+            } else {
+                None
+            },
         };
         tasks.push(tokio::spawn(run_server(config)));
     }
@@ -210,6 +225,7 @@ async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         discovery_port,
         exchange_secs,
         peers,
+        web_addr,
     } = config;
     let auth_addr = Arc::new(auth_addr);
 
@@ -267,6 +283,15 @@ async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
                 eprintln!("could not update member ids yet ({e}); will try again on the next start")
             }
         }
+    }
+
+    if let Some(web_addr) = web_addr {
+        let (state, tx, auth_addr) = (state.clone(), tx.clone(), auth_addr.clone());
+        tokio::spawn(async move {
+            if let Err(e) = web::serve(web_addr, state, tx, auth_addr).await {
+                eprintln!("the web client could not start: {e}");
+            }
+        });
     }
 
     let listener = TcpListener::bind(&addr).await?;

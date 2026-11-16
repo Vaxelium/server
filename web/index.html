@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vaxelium</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #2a2e32; }
+    canvas { display: block; width: 100% !important; height: 100% !important; outline: none; }
+    #loading { position: fixed; inset: 0; display: grid; place-items: center; color: #9aa0a6; font: 15px system-ui, sans-serif; }
+  </style>
+</head>
+<body>
+  <div id="loading">Loading Vaxelium…</div>
+  <script type="module">
+    import init from "./client.js";
+    init().catch((e) => {
+      document.getElementById("loading").textContent = "Vaxelium could not start in this browser: " + e;
+    });
+    // The app draws into a canvas of its own; the loading text goes once it is there.
+    new MutationObserver((_, watch) => {
+      if (document.querySelector("canvas")) {
+        document.getElementById("loading").remove();
+        watch.disconnect();
+      }
+    }).observe(document.body, { childList: true, subtree: true });
+  </script>
+</body>
+</html>
