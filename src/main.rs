@@ -7,10 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::{
-    ChannelRef,
-    AuthReply, AuthRequest, ChatMessage, ClientMsg, DirectMessage, RoleInfo, ServerMsg, UserStatus, DEFAULT_ADDR,
-    DEFAULT_AUTH_ADDR,
-    DISCOVERY_PORT, EVERYONE_ROLE, MAX_ROLE_NAME_LEN, MAX_SERVER_DESCRIPTION_LEN, MAX_SERVER_ICON_LEN, perm,
+    perm, AuthReply, AuthRequest, ChannelRef, ChatMessage, ClientMsg, DirectMessage, RoleInfo, ServerMsg, UserStatus,
+    DEFAULT_ADDR, DEFAULT_AUTH_ADDR, DISCOVERY_PORT, EVERYONE_ROLE, MAX_ROLE_NAME_LEN, MAX_SERVER_DESCRIPTION_LEN,
+    MAX_SERVER_ICON_LEN,
 };
 use db::Db;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -41,7 +40,9 @@ struct State {
 impl State {
     /// True while a peer removed for not answering is still in its cooldown.
     fn recently_dead(&self, addr: &str) -> bool {
-        self.dead_peers.get(addr).is_some_and(|at| at.elapsed() < discovery::DEAD_PEER_COOLDOWN)
+        self.dead_peers
+            .get(addr)
+            .is_some_and(|at| at.elapsed() < discovery::DEAD_PEER_COOLDOWN)
     }
 }
 
@@ -74,7 +75,16 @@ impl State {
                 // Invisible members are shown as offline, even while connected.
                 let online = online && status != common::PresenceStatus::Invisible;
                 let badges = badges.get(&id).cloned().unwrap_or_default();
-                UserStatus { id, name, online, owner, roles, joined, status, badges }
+                UserStatus {
+                    id,
+                    name,
+                    online,
+                    owner,
+                    roles,
+                    joined,
+                    status,
+                    badges,
+                }
             })
             .collect()
     }
@@ -161,7 +171,11 @@ async fn run() -> anyhow::Result<()> {
             } else {
                 lan_address(&server_addr)
             },
-            db_path: if count == 1 { db_path.clone() } else { numbered_path(&db_path, server_port) },
+            db_path: if count == 1 {
+                db_path.clone()
+            } else {
+                numbered_path(&db_path, server_port)
+            },
             addr: server_addr,
             auth_addr: auth_addr.clone(),
             discovery_port: discovery_base
@@ -218,7 +232,10 @@ async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
     }));
     {
         let s = state.lock().unwrap();
-        for peer in peers.iter().filter(|a| discovery::valid_addr(a) && a.as_str() != advertise) {
+        for peer in peers
+            .iter()
+            .filter(|a| discovery::valid_addr(a) && a.as_str() != advertise)
+        {
             let _ = s.db.add_peer(peer);
         }
     }
@@ -237,10 +254,15 @@ async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         match auth_call(&state, &auth_addr, &AuthRequest::Migrations { old_ids: legacy }).await {
             Ok(AuthReply::Migrations { pairs }) => {
                 let changed = state.lock().unwrap().db.apply_id_map(&pairs)?;
-                println!("updated {} member id(s) to their new ids ({changed} references)", pairs.len());
+                println!(
+                    "updated {} member id(s) to their new ids ({changed} references)",
+                    pairs.len()
+                );
             }
             Ok(_) => eprintln!("unexpected reply from the auth service about member ids"),
-            Err(e) => eprintln!("could not update member ids yet ({e}); will try again on the next start"),
+            Err(e) => {
+                eprintln!("could not update member ids yet ({e}); will try again on the next start")
+            }
         }
     }
 
@@ -334,7 +356,13 @@ where
             }
         },
         _ => {
-            send(&mut writer, &ServerMsg::Error { text: "connect with a session token first".into() }).await?;
+            send(
+                &mut writer,
+                &ServerMsg::Error {
+                    text: "connect with a session token first".into(),
+                },
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -345,14 +373,23 @@ where
         let mut s = state.lock().unwrap();
         s.db.add_member(&user, &display, now_secs())?;
         s.online.push(user.clone());
-        (s.presence(), s.db.server_name()?, s.db.server_description()?, s.db.server_icon()?)
+        (
+            s.presence(),
+            s.db.server_name()?,
+            s.db.server_description()?,
+            s.db.server_icon()?,
+        )
     };
 
     // No channel is open until the client joins one. Joining creates a channel only when it is asked for by name.
     let mut channel = String::new();
     let mut channel_id: i64 = 0;
     // Removes the user and broadcasts presence on every exit path, including errors.
-    let _online = OnlineGuard { state: state.clone(), tx: tx.clone(), user: user.clone() };
+    let _online = OnlineGuard {
+        state: state.clone(),
+        tx: tx.clone(),
+        user: user.clone(),
+    };
     let server_public = state.lock().unwrap().db.is_public().unwrap_or(false);
     let server_id = state.lock().unwrap().db.info_value("server_id")?.unwrap_or_default();
     let welcome = ServerMsg::Welcome {
@@ -383,10 +420,24 @@ where
         let own = state.lock().unwrap().advertise.clone();
         let (state2, auth2, token2) = (state.clone(), auth_addr.to_string(), session_token.clone());
         tokio::spawn(async move {
-            let _ = auth_call(&state2, &auth2, &AuthRequest::Seen { token: token2, addr: own }).await;
+            let _ = auth_call(
+                &state2,
+                &auth2,
+                &AuthRequest::Seen {
+                    token: token2,
+                    addr: own,
+                },
+            )
+            .await;
         });
     }
-    send(&mut writer, &ServerMsg::DirectMessages { list: direct_message_list(&state, &user)? }).await?;
+    send(
+        &mut writer,
+        &ServerMsg::DirectMessages {
+            list: direct_message_list(&state, &user)?,
+        },
+    )
+    .await?;
     let _ = tx.send(ServerMsg::Presence { users });
     let _ = tx.send(ServerMsg::System {
         channel_id,
@@ -429,7 +480,7 @@ where
 
                     ClientMsg::OpenDm { name } => {
                         // A member of this server, or else an account found through the auth service.
-                        let local = state.lock().unwrap().db.member_by_display_name(&name)?;
+                        let local = state.lock().unwrap().db.member_by_display(&name)?;
                         let other = match local {
                             Some(id) => Ok(id),
                             None => match auth_call(&state, &auth_addr, &AuthRequest::Lookup { name: name.clone() }).await {
@@ -471,7 +522,7 @@ where
                     ClientMsg::FetchDm { channel } => {
                         let history = {
                             let s = state.lock().unwrap();
-                            if s.db.is_direct_message_member(&channel, &user)? {
+                            if s.db.is_dm_member(&channel, &user)? {
                                 let id = s.db.ensure_channel(&channel)?;
                                 Some(s.db.history(id)?)
                             } else {
@@ -626,7 +677,7 @@ where
                             send(&mut writer, &ServerMsg::Error { text: "that channel cannot be moved there".into() }).await?;
                             continue;
                         }
-                        if !may_move_between_categories(&state, &user, id, category)? {
+                        if !may_change_category(&state, &user, id, category)? {
                             send(&mut writer, &ServerMsg::Error { text: NO_CATEGORY_LEAVE.into() }).await?;
                             continue;
                         }
@@ -648,7 +699,7 @@ where
                             send(&mut writer, &ServerMsg::Error { text: "that channel cannot be moved".into() }).await?;
                             continue;
                         }
-                        if !may_move_between_categories(&state, &user, id, category)? {
+                        if !may_change_category(&state, &user, id, category)? {
                             send(&mut writer, &ServerMsg::Error { text: NO_CATEGORY_LEAVE.into() }).await?;
                             continue;
                         }
@@ -957,7 +1008,7 @@ where
                             } else if !s.db.is_member(&member)? {
                                 Err("there is no such member".to_string())
                             } else {
-                                s.db.set_category_member_override(category, &member, common::Setting { view, send: send_setting, manage_channels, manage_messages })?;
+                                s.db.member_category_override(category, &member, common::Setting { view, send: send_setting, manage_channels, manage_messages })?;
                                 Ok((s.db.channel_member_overrides()?, s.db.category_member_overrides()?))
                             }
                         };
@@ -981,7 +1032,7 @@ where
                                 Some(name) if name.starts_with("dm-") => Err("direct messages can't have channel permissions".to_string()),
                                 Some(_) if !s.db.is_member(&member)? => Err("there is no such member".to_string()),
                                 Some(_) => {
-                                    s.db.set_channel_member_override(channel, &member, common::Setting { view, send: send_setting, manage_channels, manage_messages })?;
+                                    s.db.member_channel_override(channel, &member, common::Setting { view, send: send_setting, manage_channels, manage_messages })?;
                                     Ok((s.db.channel_member_overrides()?, s.db.category_member_overrides()?))
                                 }
                             }
@@ -1025,7 +1076,7 @@ where
                             send(&mut writer, &ServerMsg::Error { text: CANNOT_VIEW.into() }).await?;
                             continue;
                         }
-                        if message_is_cross_server(&state, id)? {
+                        if cross_server_message(&state, id)? {
                             send(&mut writer, &ServerMsg::Error { text: CROSS_SERVER_CHANGES.into() }).await?;
                             continue;
                         }
@@ -1036,7 +1087,7 @@ where
                         let allowed = {
                             let s = state.lock().unwrap();
                             match s.db.message_channel(id)? {
-                                Some(c) if c.starts_with("dm-") => s.db.is_direct_message_member(&c, &user)?,
+                                Some(c) if c.starts_with("dm-") => s.db.is_dm_member(&c, &user)?,
                                 _ => true,
                             }
                         };
@@ -1059,7 +1110,7 @@ where
                             send(&mut writer, &ServerMsg::Error { text: CANNOT_VIEW.into() }).await?;
                             continue;
                         }
-                        if message_is_cross_server(&state, id)? {
+                        if cross_server_message(&state, id)? {
                             send(&mut writer, &ServerMsg::Error { text: CROSS_SERVER_CHANGES.into() }).await?;
                             continue;
                         }
@@ -1087,7 +1138,7 @@ where
                             send(&mut writer, &ServerMsg::Error { text: CANNOT_VIEW.into() }).await?;
                             continue;
                         }
-                        if message_is_cross_server(&state, id)? {
+                        if cross_server_message(&state, id)? {
                             send(&mut writer, &ServerMsg::Error { text: CROSS_SERVER_CHANGES.into() }).await?;
                             continue;
                         }
@@ -1135,7 +1186,7 @@ where
                                 let access = Access::new(&s.db, &user)?;
                                 access.allows(message.channel_id, perm::VIEW_CHANNEL)
                                     && (!message.channel.starts_with("dm-")
-                                        || s.db.is_direct_message_member(&message.channel, &user)?)
+                                        || s.db.is_dm_member(&message.channel, &user)?)
                             };
                             if allowed {
                                 send(&mut writer, &ServerMsg::Activity { channel_id: message.channel_id }).await?;
@@ -1441,17 +1492,19 @@ async fn relay_receive(
 
 /// Passes a direct message to the server the recipient was last seen at, so their copy is stored
 /// there as well. Tries each known server in turn.
-async fn relay_out(
-    state: &SharedState,
-    auth_addr: &str,
-    token: &str,
-    to: &str,
-    text: &str,
-) -> Result<(), String> {
+async fn relay_out(state: &SharedState, auth_addr: &str, token: &str, to: &str, text: &str) -> Result<(), String> {
     let own = state.lock().unwrap().advertise.clone();
     let mut last_error = "they have not been online on any server yet".to_string();
-    for addr in locations_of(state, auth_addr, to).await.into_iter().filter(|a| *a != own) {
-        let msg = ClientMsg::RelayDm { token: token.to_string(), to: to.to_string(), text: text.to_string() };
+    for addr in locations_of(state, auth_addr, to)
+        .await
+        .into_iter()
+        .filter(|a| *a != own)
+    {
+        let msg = ClientMsg::RelayDm {
+            token: token.to_string(),
+            to: to.to_string(),
+            text: text.to_string(),
+        };
         match server_call(state, &addr, &msg).await {
             Ok(ServerMsg::RelayAck { error: None }) => return Ok(()),
             Ok(ServerMsg::RelayAck { error: Some(e) }) => last_error = e,
@@ -1465,23 +1518,26 @@ async fn relay_out(
 /// The other member of a cross-server direct message, when `channel` is one and `user` is in it.
 fn cross_server_other(state: &SharedState, channel: &str, user: &str) -> rusqlite::Result<Option<String>> {
     let s = state.lock().unwrap();
-    if !s.db.is_cross_server_dm(channel)? {
+    if !s.db.cross_server_dm(channel)? {
         return Ok(None);
     }
-    Ok(s.db.direct_message_pair(channel)?.map(|(a, b)| if a == user { b } else { a }))
+    Ok(s.db
+        .direct_message_pair(channel)?
+        .map(|(a, b)| if a == user { b } else { a }))
 }
 
 /// Whether a message is in a direct message kept in step with another server.
-fn message_is_cross_server(state: &SharedState, id: i64) -> rusqlite::Result<bool> {
+fn cross_server_message(state: &SharedState, id: i64) -> rusqlite::Result<bool> {
     let s = state.lock().unwrap();
     match s.db.message_channel(id)? {
-        Some(channel) => s.db.is_cross_server_dm(&channel),
+        Some(channel) => s.db.cross_server_dm(&channel),
         None => Ok(false),
     }
 }
 
 /// Whether a direct message was relayed from or to another server, so it cannot be changed here.
-const CROSS_SERVER_CHANGES: &str = "editing, deleting and reacting are not available on direct messages between servers yet";
+const CROSS_SERVER_CHANGES: &str =
+    "editing, deleting and reacting are not available on direct messages between servers yet";
 
 async fn check_session(state: &SharedState, auth_addr: &str, token: &str) -> Result<Identity, String> {
     match verify_session(state, auth_addr, token).await {
@@ -1533,8 +1589,10 @@ async fn verify_session(state: &SharedState, auth_addr: &str, token: &str) -> Re
     if !pin_ok(state, "auth", auth_addr, &fingerprint) {
         return Err(Rejected("the auth service's certificate has changed".into()));
     }
-    let mut request = serde_json::to_string(&AuthRequest::Verify { token: token.to_string() })
-        .map_err(|e| Unreachable(e.to_string()))?;
+    let mut request = serde_json::to_string(&AuthRequest::Verify {
+        token: token.to_string(),
+    })
+    .map_err(|e| Unreachable(e.to_string()))?;
     request.push('\n');
     stream
         .write_all(request.as_bytes())
@@ -1573,16 +1631,31 @@ impl Drop for OnlineGuard {
 
 /// Sends a member the channels and categories they may view now. Sent again whenever permissions change,
 /// so an open client shows a channel as soon as it becomes visible, and hides one that is no longer.
-async fn send_visible_channels<W: AsyncWrite + Unpin>(writer: &mut W, state: &SharedState, user: &str) -> anyhow::Result<()> {
+async fn send_visible_channels<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    state: &SharedState,
+    user: &str,
+) -> anyhow::Result<()> {
     let (channels, categories, uncategorized) = {
         let s = state.lock().unwrap();
         let access = Access::new(&s.db, user)?;
         let (categories, uncategorized) = visible_layout(&access, s.db.categories()?, s.db.uncategorized_channels()?);
-        let channels = s.db.channel_list()?.into_iter().filter(|c| access.allows(c.id, perm::VIEW_CHANNEL)).collect();
+        let channels =
+            s.db.channel_list()?
+                .into_iter()
+                .filter(|c| access.allows(c.id, perm::VIEW_CHANNEL))
+                .collect();
         (channels, categories, uncategorized)
     };
     send(writer, &ServerMsg::Channels { channels }).await?;
-    send(writer, &ServerMsg::Categories { categories, uncategorized }).await?;
+    send(
+        writer,
+        &ServerMsg::Categories {
+            categories,
+            uncategorized,
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -1595,12 +1668,16 @@ async fn send<W: AsyncWrite + Unpin>(writer: &mut W, msg: &ServerMsg) -> anyhow:
 
 /// Joins a channel by its name for this account. Returns the channel's id and its history, or `None`
 /// when the channel is a direct message the account is not a member of.
-fn join_channel(state: &SharedState, user: &str, name: &str) -> Result<Option<(i64, Vec<ChatMessage>)>, rusqlite::Error> {
+fn join_channel(
+    state: &SharedState,
+    user: &str,
+    name: &str,
+) -> Result<Option<(i64, Vec<ChatMessage>)>, rusqlite::Error> {
     // Direct messages are joined only by their two members. Other names starting with "dm-" are
     // refused, so a normal channel can never take one.
     let s = state.lock().unwrap();
     let id = if name.starts_with("dm-") {
-        if !s.db.is_direct_message_member(name, user)? {
+        if !s.db.is_dm_member(name, user)? {
             return Ok(None);
         }
         s.db.ensure_channel(name)?
@@ -1646,11 +1723,18 @@ impl Power {
 /// Works out what `user` may do. `order` is every role, highest first.
 fn power_of(db: &Db, user: &str, order: &[RoleInfo]) -> rusqlite::Result<Power> {
     if db.owner()?.as_deref() == Some(user) {
-        return Ok(Power { owner: true, perms: perm::ALL, top: None });
+        return Ok(Power {
+            owner: true,
+            perms: perm::ALL,
+            top: None,
+        });
     }
     let mine = db.member_role_ids(user)?;
     // Everyone has @everyone, so its permissions apply first. It never counts as a member's highest role.
-    let mut perms = order.iter().find(|r| r.id == EVERYONE_ROLE).map_or(0, |r| r.permissions);
+    let mut perms = order
+        .iter()
+        .find(|r| r.id == EVERYONE_ROLE)
+        .map_or(0, |r| r.permissions);
     let mut top = None;
     for (index, role) in order.iter().enumerate() {
         if role.id != EVERYONE_ROLE && mine.contains(&role.id) {
@@ -1658,7 +1742,11 @@ fn power_of(db: &Db, user: &str, order: &[RoleInfo]) -> rusqlite::Result<Power> 
             top.get_or_insert(index);
         }
     }
-    Ok(Power { owner: false, perms, top })
+    Ok(Power {
+        owner: false,
+        perms,
+        top,
+    })
 }
 
 /// True when `user` has the permission. The owner has every permission.
@@ -1671,7 +1759,7 @@ fn may_in_channel(state: &SharedState, user: &str, channel: i64, permission: u32
 /// Whether the member may move a channel to the category `to` (None for no category). Moving within the
 /// same category needs only the channel's own permission. Leaving a category, or joining one, needs Manage
 /// channel in that category too.
-fn may_move_between_categories(state: &SharedState, user: &str, channel: i64, to: Option<i64>) -> rusqlite::Result<bool> {
+fn may_change_category(state: &SharedState, user: &str, channel: i64, to: Option<i64>) -> rusqlite::Result<bool> {
     let from = state.lock().unwrap().db.channel_category(channel)?;
     if from == to {
         return Ok(true);
@@ -1739,17 +1827,33 @@ impl Access {
 
     /// What the channel's own settings say about one permission for this member, `None` when they say nothing.
     fn channel_grant(&self, channel_id: i64, bit: u32) -> Option<bool> {
-        let member = self.member_overrides.iter().find(|o| o.channel_id == channel_id && o.member == self.user).map(|o| o.setting());
-        let roles: Vec<common::Setting> =
-            self.overrides.iter().filter(|o| o.channel_id == channel_id && self.held.contains(&o.role)).map(|o| o.setting()).collect();
+        let member = self
+            .member_overrides
+            .iter()
+            .find(|o| o.channel_id == channel_id && o.member == self.user)
+            .map(|o| o.setting());
+        let roles: Vec<common::Setting> = self
+            .overrides
+            .iter()
+            .filter(|o| o.channel_id == channel_id && self.held.contains(&o.role))
+            .map(|o| o.setting())
+            .collect();
         common::grant(member, &roles, bit)
     }
 
     /// What a category's settings say about one permission for this member, `None` when they say nothing.
     fn category_grant(&self, category_id: i64, bit: u32) -> Option<bool> {
-        let member = self.member_category_overrides.iter().find(|o| o.category_id == category_id && o.member == self.user).map(|o| o.setting());
-        let roles: Vec<common::Setting> =
-            self.category_overrides.iter().filter(|o| o.category_id == category_id && self.held.contains(&o.role)).map(|o| o.setting()).collect();
+        let member = self
+            .member_category_overrides
+            .iter()
+            .find(|o| o.category_id == category_id && o.member == self.user)
+            .map(|o| o.setting());
+        let roles: Vec<common::Setting> = self
+            .category_overrides
+            .iter()
+            .filter(|o| o.category_id == category_id && self.held.contains(&o.role))
+            .map(|o| o.setting())
+            .collect();
         common::grant(member, &roles, bit)
     }
 
@@ -1764,7 +1868,8 @@ impl Access {
         if self.power.has(perm::MANAGE_CHANNELS) {
             return true;
         }
-        self.channel_grant(channel_id, bit).unwrap_or_else(|| self.power.has(bit))
+        self.channel_grant(channel_id, bit)
+            .unwrap_or_else(|| self.power.has(bit))
     }
 
     /// Whether the member may manage a channel: rename, move, delete and change its permissions
@@ -1776,17 +1881,23 @@ impl Access {
             Some(name) if name.starts_with("dm-") => return false,
             Some(_) => {}
         }
-        self.channel_grant(channel_id, bit).unwrap_or_else(|| self.power.has(bit))
+        self.channel_grant(channel_id, bit)
+            .unwrap_or_else(|| self.power.has(bit))
     }
 
     /// Whether the member may manage a category: rename it, delete it, or change its permissions.
     fn manages_category(&self, category_id: i64, bit: u32) -> bool {
-        self.category_grant(category_id, bit).unwrap_or_else(|| self.power.has(bit))
+        self.category_grant(category_id, bit)
+            .unwrap_or_else(|| self.power.has(bit))
     }
 }
 
 /// The categories and the channels outside them, with only the channels this member may view.
-fn visible_layout(access: &Access, categories: Vec<common::CategoryInfo>, uncategorized: Vec<common::ChannelRef>) -> (Vec<common::CategoryInfo>, Vec<common::ChannelRef>) {
+fn visible_layout(
+    access: &Access,
+    categories: Vec<common::CategoryInfo>,
+    uncategorized: Vec<common::ChannelRef>,
+) -> (Vec<common::CategoryInfo>, Vec<common::ChannelRef>) {
     let categories = categories
         .into_iter()
         .map(|mut c| {
@@ -1794,7 +1905,10 @@ fn visible_layout(access: &Access, categories: Vec<common::CategoryInfo>, uncate
             c
         })
         .collect();
-    let uncategorized = uncategorized.into_iter().filter(|ch| access.allows(ch.id, perm::VIEW_CHANNEL)).collect();
+    let uncategorized = uncategorized
+        .into_iter()
+        .filter(|ch| access.allows(ch.id, perm::VIEW_CHANNEL))
+        .collect();
     (categories, uncategorized)
 }
 
@@ -1821,9 +1935,17 @@ const EVERYONE_KEEPS: &str = "@everyone keeps View channels and Message channels
 /// True when setting @everyone's permissions to `permissions` would drop one of the kept bits that no
 /// other role holds.
 fn removes_everyone_keep(db: &Db, permissions: u32) -> rusqlite::Result<bool> {
-    let others = db.role_list()?.into_iter().filter(|r| r.id != EVERYONE_ROLE).map(|r| r.permissions).collect::<Vec<_>>();
+    let others = db
+        .role_list()?
+        .into_iter()
+        .filter(|r| r.id != EVERYONE_ROLE)
+        .map(|r| r.permissions)
+        .collect::<Vec<_>>();
     for bit in [perm::VIEW_CHANNEL, perm::SEND_MESSAGES] {
-        if EVERYONE_KEEPS_BITS & bit != 0 && permissions & bit == 0 && !others.iter().any(|p| p & (bit | perm::ADMINISTRATOR) != 0) {
+        if EVERYONE_KEEPS_BITS & bit != 0
+            && permissions & bit == 0
+            && !others.iter().any(|p| p & (bit | perm::ADMINISTRATOR) != 0)
+        {
             return Ok(true);
         }
     }
@@ -1832,11 +1954,33 @@ fn removes_everyone_keep(db: &Db, permissions: u32) -> rusqlite::Result<bool> {
 
 /// A change to the roles, asked for by a member.
 enum RoleChange {
-    Create { name: String, color: String, permissions: u32, mentionable: bool, hoisted: bool },
-    Update { role: i64, name: String, color: String, permissions: u32, mentionable: bool, hoisted: bool },
-    Delete { role: i64 },
-    Move { role: i64, before: Option<i64> },
-    Member { user: String, role: i64, on: bool },
+    Create {
+        name: String,
+        color: String,
+        permissions: u32,
+        mentionable: bool,
+        hoisted: bool,
+    },
+    Update {
+        role: i64,
+        name: String,
+        color: String,
+        permissions: u32,
+        mentionable: bool,
+        hoisted: bool,
+    },
+    Delete {
+        role: i64,
+    },
+    Move {
+        role: i64,
+        before: Option<i64>,
+    },
+    Member {
+        user: String,
+        role: i64,
+        on: bool,
+    },
 }
 
 /// Why a role's name, colour or permissions are not allowed, or `None` when they are fine.
@@ -1869,7 +2013,13 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
     let below_you = "that role is not below your highest role";
     let no_role = "there is no such role";
     match change {
-        RoleChange::Create { name, color, permissions, mentionable, hoisted } => {
+        RoleChange::Create {
+            name,
+            color,
+            permissions,
+            mentionable,
+            hoisted,
+        } => {
             let name = name.trim().to_string();
             if let Some(text) = role_fields_error(&power, &name, &color, permissions) {
                 return Ok(Err(text));
@@ -1879,12 +2029,29 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
                 None => Ok(Err("a role with that name already exists".into())),
             }
         }
-        RoleChange::Update { role, name, color, permissions, mentionable, hoisted } => {
+        RoleChange::Update {
+            role,
+            name,
+            color,
+            permissions,
+            mentionable,
+            hoisted,
+        } => {
             // @everyone keeps its name.
-            let name = if role == EVERYONE_ROLE { "@everyone".to_string() } else { name.trim().to_string() };
+            let name = if role == EVERYONE_ROLE {
+                "@everyone".to_string()
+            } else {
+                name.trim().to_string()
+            };
             // @everyone already reaches everyone, so it cannot be pinged or grouped.
-            let (mentionable, hoisted) = if role == EVERYONE_ROLE { (false, false) } else { (mentionable, hoisted) };
-            let Some(index) = index_of(role) else { return Ok(Err(no_role.into())) };
+            let (mentionable, hoisted) = if role == EVERYONE_ROLE {
+                (false, false)
+            } else {
+                (mentionable, hoisted)
+            };
+            let Some(index) = index_of(role) else {
+                return Ok(Err(no_role.into()));
+            };
             if !power.outranks(index) {
                 return Ok(Err(below_you.into()));
             }
@@ -1907,7 +2074,9 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
             if role == EVERYONE_ROLE {
                 return Ok(Err("@everyone cannot be deleted".into()));
             }
-            let Some(index) = index_of(role) else { return Ok(Err(no_role.into())) };
+            let Some(index) = index_of(role) else {
+                return Ok(Err(no_role.into()));
+            };
             if !power.outranks(index) {
                 return Ok(Err(below_you.into()));
             }
@@ -1918,7 +2087,9 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
             if role == EVERYONE_ROLE {
                 return Ok(Err("@everyone stays at the bottom".into()));
             }
-            let Some(index) = index_of(role) else { return Ok(Err(no_role.into())) };
+            let Some(index) = index_of(role) else {
+                return Ok(Err(no_role.into()));
+            };
             if !power.outranks(index) {
                 return Ok(Err(below_you.into()));
             }
@@ -1949,7 +2120,9 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
             if role == EVERYONE_ROLE {
                 return Ok(Err("@everyone is given to everyone automatically".into()));
             }
-            let Some(index) = index_of(role) else { return Ok(Err(no_role.into())) };
+            let Some(index) = index_of(role) else {
+                return Ok(Err(no_role.into()));
+            };
             if !power.outranks(index) {
                 return Ok(Err(below_you.into()));
             }
@@ -2010,7 +2183,11 @@ fn change_badges(
                 true => None,
                 false => Some("there is no such badge".to_string()),
             },
-            BadgeChange::Member { user: member, badge, on } => {
+            BadgeChange::Member {
+                user: member,
+                badge,
+                on,
+            } => {
                 if !s.db.badge_exists(badge)? {
                     Some("there is no such badge".to_string())
                 } else if !s.db.is_member(&member)? {
@@ -2071,7 +2248,10 @@ fn broadcast_categories(state: &Arc<Mutex<State>>, tx: &broadcast::Sender<Server
         let s = state.lock().unwrap();
         (s.db.categories()?, s.db.uncategorized_channels()?)
     };
-    let _ = tx.send(ServerMsg::Categories { categories, uncategorized });
+    let _ = tx.send(ServerMsg::Categories {
+        categories,
+        uncategorized,
+    });
     Ok(())
 }
 
@@ -2093,453 +2273,5 @@ fn now_secs() -> u64 {
 }
 
 #[cfg(test)]
-mod role_tests {
-    use super::*;
-
-    /// The owner, then "bob" who has the Admin role (manage roles and channels) and "carol" who has none.
-    fn server() -> (Db, i64, i64) {
-        let db = Db::open(":memory:").unwrap();
-        db.add_member("owner", "Owner", 1).unwrap();
-        db.add_member("bob", "Bob", 2).unwrap();
-        db.add_member("carol", "Carol", 3).unwrap();
-        db.add_member("dan", "Dan", 4).unwrap();
-        let admin = db
-            .create_role("Admin", "", perm::MANAGE_ROLES | perm::MANAGE_CHANNELS, false, false)
-            .unwrap()
-            .unwrap();
-        let mods = db.create_role("Mods", "#00ff00", perm::MANAGE_MESSAGES, false, false).unwrap().unwrap();
-        // Admin sits above Mods, as it does after creation order: Mods was created last, so is lowest.
-        db.set_role_order(&[admin, mods]).unwrap();
-        db.set_member_role("bob", admin, true).unwrap();
-        db.set_member_role("dan", admin, true).unwrap();
-        (db, admin, mods)
-    }
-
-    #[test]
-    fn channel_view_and_send_follow_roles_and_channel_exceptions() {
-        let (db, _, _) = server();
-        db.add_member("erin", "Erin", 5).unwrap();
-        let general = db.ensure_channel("general").unwrap();
-        let readers = db.create_role("Readers", "", perm::VIEW_CHANNEL | perm::SEND_MESSAGES, false, false).unwrap().unwrap();
-        let viewers = db.create_role("Viewers", "", perm::VIEW_CHANNEL, false, false).unwrap().unwrap();
-        db.set_member_role("bob", readers, true).unwrap();
-        db.set_member_role("carol", viewers, true).unwrap();
-        // Take the channel permissions off @everyone. Other roles hold them, so that is allowed.
-        let off = apply_role_change(
-            &db,
-            "owner",
-            RoleChange::Update { role: EVERYONE_ROLE, name: String::new(), color: String::new(), permissions: 0, mentionable: false, hoisted: false },
-        )
-        .unwrap();
-        assert_eq!(off, Ok(()));
-
-        // Nobody sees a channel without a role that gives it. Owners and managers see every channel.
-        assert!(!Access::new(&db, "erin").unwrap().allows(general, perm::VIEW_CHANNEL));
-        assert!(Access::new(&db, "owner").unwrap().allows(general, perm::SEND_MESSAGES));
-
-        let bob = Access::new(&db, "bob").unwrap();
-        assert!(bob.allows(general, perm::VIEW_CHANNEL) && bob.allows(general, perm::SEND_MESSAGES));
-
-        // A viewer may read, but not send.
-        let carol = Access::new(&db, "carol").unwrap();
-        assert!(carol.allows(general, perm::VIEW_CHANNEL));
-        assert!(!carol.allows(general, perm::SEND_MESSAGES));
-
-        // A denial on the channel for one of the member's roles hides it, even with a server-wide grant.
-        db.set_channel_override(general, viewers, common::Setting { view: Some(false), send: None, ..Default::default() }).unwrap();
-        assert!(!Access::new(&db, "carol").unwrap().allows(general, perm::VIEW_CHANNEL));
-
-        // An allowance on the channel gives a role access it does not have server-wide.
-        db.set_channel_override(general, viewers, common::Setting { view: None, send: None, ..Default::default() }).unwrap();
-        db.set_channel_override(general, EVERYONE_ROLE, common::Setting { view: Some(true), send: None, ..Default::default() }).unwrap();
-        assert!(Access::new(&db, "erin").unwrap().allows(general, perm::VIEW_CHANNEL));
-
-        // A send denial stops sending but not viewing.
-        db.set_channel_override(general, viewers, common::Setting { view: None, send: Some(false), ..Default::default() }).unwrap();
-        assert!(!Access::new(&db, "carol").unwrap().allows(general, perm::SEND_MESSAGES));
-        assert!(Access::new(&db, "carol").unwrap().allows(general, perm::VIEW_CHANNEL));
-
-        // Removing an exception puts the server-wide permission back.
-        db.set_channel_override(general, viewers, common::Setting { view: None, send: None, ..Default::default() }).unwrap();
-        assert!(!Access::new(&db, "carol").unwrap().allows(general, perm::SEND_MESSAGES));
-        assert!(db.channel_overrides().unwrap().iter().all(|o| o.role != viewers));
-    }
-
-    #[test]
-    fn ping_and_member_list_flags_are_saved_and_changed() {
-        let (db, _, _) = server();
-        let made = apply_role_change(
-            &db,
-            "owner",
-            RoleChange::Create { name: "Pingers".into(), color: String::new(), permissions: 0, mentionable: true, hoisted: true },
-        )
-        .unwrap();
-        assert!(made.is_ok());
-        let pingers = db.role_list().unwrap().into_iter().find(|r| r.name == "Pingers").unwrap();
-        assert!(pingers.mentionable && pingers.hoisted);
-        let off = apply_role_change(
-            &db,
-            "owner",
-            RoleChange::Update { role: pingers.id, name: "Pingers".into(), color: String::new(), permissions: 0, mentionable: false, hoisted: false },
-        )
-        .unwrap();
-        assert!(off.is_ok());
-        let pingers = db.role_list().unwrap().into_iter().find(|r| r.id == pingers.id).unwrap();
-        assert!(!pingers.mentionable && !pingers.hoisted);
-    }
-
-    #[test]
-    fn owner_can_do_everything() {
-        let (db, _, _) = server();
-        let made = apply_role_change(
-            &db,
-            "owner",
-            RoleChange::Create { name: "Helpers".into(), color: "#123456".into(), permissions: perm::ALL , mentionable: false, hoisted: false },
-        )
-        .unwrap();
-        assert_eq!(made, Ok(()));
-        assert!(db.role_list().unwrap().iter().any(|r| r.name == "Helpers"));
-    }
-
-    #[test]
-    fn members_without_manage_roles_cannot_change_roles() {
-        let (db, _, mods) = server();
-        let refused = apply_role_change(
-            &db,
-            "carol",
-            RoleChange::Member { user: "carol".into(), role: mods, on: true },
-        )
-        .unwrap();
-        assert!(refused.is_err());
-        let refused = apply_role_change(
-            &db,
-            "carol",
-            RoleChange::Create { name: "X".into(), color: String::new(), permissions: 0 , mentionable: false, hoisted: false },
-        )
-        .unwrap();
-        assert!(refused.is_err());
-    }
-
-    #[test]
-    fn admins_give_roles_below_them_only() {
-        let (db, admin, mods) = server();
-        let given = apply_role_change(
-            &db,
-            "bob",
-            RoleChange::Member { user: "carol".into(), role: mods, on: true },
-        )
-        .unwrap();
-        assert_eq!(given, Ok(()));
-        assert_eq!(db.member_role_ids("carol").unwrap(), vec![mods]);
-
-        // Admin is not below bob's own highest role, so bob cannot give it.
-        let refused = apply_role_change(
-            &db,
-            "bob",
-            RoleChange::Member { user: "carol".into(), role: admin, on: true },
-        )
-        .unwrap();
-        assert!(refused.is_err());
-        // Dan has the same highest role as bob, so bob cannot change his roles.
-        let refused = apply_role_change(
-            &db,
-            "bob",
-            RoleChange::Member { user: "dan".into(), role: mods, on: false },
-        )
-        .unwrap();
-        assert!(refused.is_err());
-    }
-
-    #[test]
-    fn admins_cannot_give_permissions_they_lack() {
-        let (db, _, _) = server();
-        let refused = apply_role_change(
-            &db,
-            "bob",
-            RoleChange::Create { name: "Owners".into(), color: String::new(), permissions: perm::ALL , mentionable: false, hoisted: false },
-        )
-        .unwrap();
-        // Bob has MANAGE_ROLES and MANAGE_CHANNELS, not MANAGE_MESSAGES.
-        assert!(refused.is_err());
-        let fine = apply_role_change(
-            &db,
-            "bob",
-            RoleChange::Create { name: "Cleaners".into(), color: String::new(), permissions: perm::MANAGE_CHANNELS , mentionable: false, hoisted: false },
-        )
-        .unwrap();
-        assert_eq!(fine, Ok(()));
-    }
-
-    #[test]
-    fn roles_are_checked_for_names_and_colours() {
-        let (db, _, mods) = server();
-        let taken = apply_role_change(
-            &db,
-            "owner",
-            RoleChange::Create { name: "Mods".into(), color: String::new(), permissions: 0 , mentionable: false, hoisted: false },
-        )
-        .unwrap();
-        assert!(taken.is_err());
-        let bad_colour = apply_role_change(
-            &db,
-            "owner",
-            RoleChange::Update { role: mods, name: "Mods".into(), color: "red".into(), permissions: 0 , mentionable: false, hoisted: false },
-        )
-        .unwrap();
-        assert!(bad_colour.is_err());
-    }
-
-    #[test]
-    fn deleting_a_role_takes_it_from_members() {
-        let (db, _, mods) = server();
-        apply_role_change(&db, "owner", RoleChange::Member { user: "carol".into(), role: mods, on: true })
-            .unwrap()
-            .unwrap();
-        apply_role_change(&db, "owner", RoleChange::Delete { role: mods }).unwrap().unwrap();
-        assert!(db.member_role_ids("carol").unwrap().is_empty());
-        assert!(db.role_list().unwrap().iter().all(|r| r.id != mods));
-    }
-
-    #[test]
-    fn admins_cannot_move_roles_above_their_own() {
-        let (db, admin, mods) = server();
-        // Bob tries to move Mods above Admin, which would put it above his own role.
-        let refused = apply_role_change(&db, "bob", RoleChange::Move { role: mods, before: Some(admin) }).unwrap();
-        assert!(refused.is_err());
-        // Bob cannot move Admin at all: it is his own highest role.
-        let refused = apply_role_change(&db, "bob", RoleChange::Move { role: admin, before: None }).unwrap();
-        assert!(refused.is_err());
-        // The owner can.
-        let moved = apply_role_change(&db, "owner", RoleChange::Move { role: admin, before: None }).unwrap();
-        assert_eq!(moved, Ok(()));
-        let order: Vec<i64> = db.role_list().unwrap().iter().map(|r| r.id).filter(|&id| id != EVERYONE_ROLE).collect();
-        assert_eq!(order, vec![mods, admin]);
-    }
-
-    #[test]
-    fn only_the_owner_changes_the_owners_roles() {
-        let (db, admin, mods) = server();
-        // Bob outranks Mods, but the owner outranks everyone, so he may not change the owner's roles.
-        let refused = apply_role_change(
-            &db,
-            "bob",
-            RoleChange::Member { user: "owner".into(), role: mods, on: true },
-        )
-        .unwrap();
-        assert!(refused.is_err());
-        // The owner may give themselves a role, and it shows on the owner.
-        let given = apply_role_change(
-            &db,
-            "owner",
-            RoleChange::Member { user: "owner".into(), role: admin, on: true },
-        )
-        .unwrap();
-        assert_eq!(given, Ok(()));
-        assert_eq!(db.member_role_ids("owner").unwrap(), vec![admin]);
-    }
-}
-
-#[cfg(test)]
-mod member_override_tests {
-    use super::*;
-
-    fn server() -> Db {
-        let db = Db::open(":memory:").unwrap();
-        db.add_member("owner", "Owner", 1).unwrap();
-        db.add_member("carol", "Carol", 2).unwrap();
-        db
-    }
-
-    #[test]
-    fn a_members_setting_beats_their_roles_setting_for_that_channel() {
-        let db = server();
-        let general = db.ensure_channel("general").unwrap();
-        // Everyone may view the channel, but carol is denied it herself.
-        db.set_channel_override(general, EVERYONE_ROLE, common::Setting { view: Some(true), send: None, ..Default::default() }).unwrap();
-        assert!(Access::new(&db, "carol").unwrap().allows(general, perm::VIEW_CHANNEL));
-        db.set_channel_member_override(general, "carol", common::Setting { view: Some(false), send: None, ..Default::default() }).unwrap();
-        assert!(!Access::new(&db, "carol").unwrap().allows(general, perm::VIEW_CHANNEL), "carol's own denial wins");
-        assert!(Access::new(&db, "owner").unwrap().allows(general, perm::VIEW_CHANNEL), "other members are not affected");
-        // A member's allowance wins over a role's denial too.
-        db.set_channel_override(general, EVERYONE_ROLE, common::Setting { view: Some(false), send: None, ..Default::default() }).unwrap();
-        db.set_channel_member_override(general, "carol", common::Setting { view: Some(true), send: None, ..Default::default() }).unwrap();
-        assert!(Access::new(&db, "carol").unwrap().allows(general, perm::VIEW_CHANNEL));
-    }
-
-    #[test]
-    fn manage_channels_can_be_given_or_taken_per_channel() {
-        let db = server();
-        let a = db.ensure_channel("a").unwrap();
-        let b = db.ensure_channel("b").unwrap();
-        // A role with Manage channels everywhere, which carol holds.
-        let mods = db.create_role("Mods", "", perm::MANAGE_CHANNELS, false, false).unwrap().unwrap();
-        apply_role_change(&db, "owner", RoleChange::Member { user: "carol".into(), role: mods, on: true }).unwrap().unwrap();
-        assert!(Access::new(&db, "carol").unwrap().manages(a, perm::MANAGE_CHANNELS));
-        // Taken away in channel a only.
-        db.set_channel_override(a, mods, common::Setting { manage_channels: Some(false), ..Default::default() }).unwrap();
-        assert!(!Access::new(&db, "carol").unwrap().manages(a, perm::MANAGE_CHANNELS), "the channel's denial wins");
-        assert!(Access::new(&db, "carol").unwrap().manages(b, perm::MANAGE_CHANNELS), "other channels keep it");
-        // Manage messages is separate from manage channels.
-        assert!(!Access::new(&db, "carol").unwrap().manages(b, perm::MANAGE_MESSAGES));
-    }
-
-    #[test]
-    fn a_category_manage_setting_reaches_its_channels() {
-        let db = server();
-        let a = db.ensure_channel("a").unwrap();
-        let cat = db.create_category("Group").unwrap().expect("made");
-        db.move_channel(a, Some(cat)).unwrap();
-        let mods = db.create_role("Mods", "", 0, false, false).unwrap().unwrap();
-        apply_role_change(&db, "owner", RoleChange::Member { user: "carol".into(), role: mods, on: true }).unwrap().unwrap();
-        assert!(!Access::new(&db, "carol").unwrap().manages_category(cat, perm::MANAGE_CHANNELS));
-        db.set_category_override(cat, mods, common::Setting { manage_channels: Some(true), ..Default::default() }).unwrap();
-        assert!(Access::new(&db, "carol").unwrap().manages_category(cat, perm::MANAGE_CHANNELS));
-        assert!(Access::new(&db, "carol").unwrap().manages(a, perm::MANAGE_CHANNELS), "the channel in it is managed too");
-    }
-
-    #[test]
-    fn a_category_member_setting_reaches_its_channels_and_moved_in_channels() {
-        let db = server();
-        let a = db.ensure_channel("a").unwrap();
-        let cat = db.create_category("Group").unwrap().expect("made");
-        db.move_channel(a, Some(cat)).unwrap();
-        db.set_category_member_override(cat, "carol", common::Setting { view: Some(false), send: None, ..Default::default() }).unwrap();
-        assert!(!Access::new(&db, "carol").unwrap().allows(a, perm::VIEW_CHANNEL));
-        // A channel moved into the category takes the member settings too.
-        let b = db.ensure_channel("b").unwrap();
-        db.move_channel(b, Some(cat)).unwrap();
-        assert!(!Access::new(&db, "carol").unwrap().allows(b, perm::VIEW_CHANNEL));
-        assert_eq!(db.category_member_overrides().unwrap().len(), 1);
-    }
-}
-
-#[cfg(test)]
-mod everyone_tests {
-    use super::*;
-
-    fn server() -> Db {
-        let db = Db::open(":memory:").unwrap();
-        db.add_member("owner", "Owner", 1).unwrap();
-        db.add_member("carol", "Carol", 2).unwrap();
-        db
-    }
-
-    #[test]
-    fn everyone_is_listed_last_and_cannot_be_deleted_moved_or_given() {
-        let db = server();
-        let order = db.role_list().unwrap();
-        assert_eq!(order.last().map(|r| r.id), Some(EVERYONE_ROLE));
-        let mods = db.create_role("Mods", "", 0, false, false).unwrap().unwrap();
-        assert_eq!(db.role_list().unwrap().last().map(|r| r.id), Some(EVERYONE_ROLE), "new roles go above @everyone");
-        assert!(apply_role_change(&db, "owner", RoleChange::Delete { role: EVERYONE_ROLE }).unwrap().is_err());
-        assert!(apply_role_change(&db, "owner", RoleChange::Move { role: EVERYONE_ROLE, before: None }).unwrap().is_err());
-        assert!(apply_role_change(&db, "owner", RoleChange::Member { user: "carol".into(), role: EVERYONE_ROLE, on: true }).unwrap().is_err());
-        // Reordering the real roles leaves @everyone at the bottom.
-        apply_role_change(&db, "owner", RoleChange::Move { role: mods, before: None }).unwrap().unwrap();
-        assert_eq!(db.role_list().unwrap().last().map(|r| r.id), Some(EVERYONE_ROLE));
-    }
-
-    #[test]
-    fn everyone_permissions_apply_to_every_member() {
-        let db = server();
-        let given = apply_role_change(
-            &db,
-            "owner",
-            RoleChange::Update {
-                role: EVERYONE_ROLE,
-                name: "x".into(),
-                color: "#112233".into(),
-                permissions: perm::MANAGE_MESSAGES | perm::VIEW_CHANNEL | perm::SEND_MESSAGES,
-                mentionable: false,
-                hoisted: false,
-            },
-        )
-        .unwrap();
-        assert_eq!(given, Ok(()));
-        let everyone = db.role_list().unwrap().into_iter().find(|r| r.id == EVERYONE_ROLE).unwrap();
-        assert_eq!(everyone.name, "@everyone", "its name is fixed");
-        assert_eq!(everyone.color, "#112233");
-        let order = db.role_list().unwrap();
-        // Carol has no roles at all, but still holds @everyone's permissions.
-        let carol = power_of(&db, "carol", &order).unwrap();
-        assert!(carol.has(perm::MANAGE_MESSAGES));
-        assert!(!carol.has(perm::MANAGE_CHANNELS));
-        assert!(carol.top.is_none());
-    }
-
-    #[test]
-    fn administrator_has_everything_even_when_a_channel_denies_it() {
-        let db = server();
-        db.add_member("erin", "Erin", 5).unwrap();
-        let general = db.ensure_channel("general").unwrap();
-        db.set_channel_override(general, EVERYONE_ROLE, common::Setting { view: None, send: None, ..Default::default() }).unwrap();
-        let admins = db.create_role("Administrators", "", perm::ADMINISTRATOR, false, false).unwrap().unwrap();
-        db.set_member_role("erin", admins, true).unwrap();
-        db.set_channel_override(general, admins, common::Setting { view: Some(false), send: Some(false), ..Default::default() }).unwrap();
-        // The denial is for a role erin holds, but administrators can still see and send.
-        let erin = Access::new(&db, "erin").unwrap();
-        assert!(erin.allows(general, perm::VIEW_CHANNEL));
-        assert!(erin.allows(general, perm::SEND_MESSAGES));
-        assert!(erin.power.has(perm::MANAGE_ROLES));
-        // An administrator may give out any permission, since they have all of them.
-        let order = db.role_list().unwrap();
-        let power = power_of(&db, "erin", &order).unwrap();
-        assert_eq!(power.grantable(), perm::ALL);
-    }
-
-    #[test]
-    fn status_is_saved_per_member() {
-        let db = server();
-        assert!(db.statuses().unwrap().is_empty());
-        db.set_status("bob", common::PresenceStatus::DoNotDisturb).unwrap();
-        db.set_status("bob", common::PresenceStatus::Idle).unwrap();
-        db.set_status("carol", common::PresenceStatus::Invisible).unwrap();
-        let statuses = db.statuses().unwrap();
-        assert_eq!(statuses.get("bob"), Some(&common::PresenceStatus::Idle));
-        assert_eq!(statuses.get("carol"), Some(&common::PresenceStatus::Invisible));
-        assert!(!statuses.contains_key("dan"));
-    }
-
-    #[test]
-    fn everyone_keeps_channel_permissions_until_another_role_has_them() {
-        let db = server();
-        let everyone = |permissions: u32| RoleChange::Update {
-            role: EVERYONE_ROLE,
-            name: String::new(),
-            color: String::new(),
-            permissions,
-            mentionable: false,
-            hoisted: false,
-        };
-        // @everyone starts with both channel permissions.
-        let start = db.role_list().unwrap().into_iter().find(|r| r.id == EVERYONE_ROLE).unwrap();
-        assert_eq!(start.permissions & (perm::VIEW_CHANNEL | perm::SEND_MESSAGES), perm::VIEW_CHANNEL | perm::SEND_MESSAGES);
-
-        // Nobody else holds them yet, so they cannot be taken away.
-        assert_eq!(apply_role_change(&db, "owner", everyone(0)).unwrap(), Err(EVERYONE_KEEPS.into()));
-        assert_eq!(apply_role_change(&db, "owner", everyone(perm::VIEW_CHANNEL)).unwrap(), Err(EVERYONE_KEEPS.into()));
-
-        // Once another role holds View channels, @everyone may drop it, but not Message channels.
-        db.create_role("Viewers", "", perm::VIEW_CHANNEL, false, false).unwrap().unwrap();
-        assert_eq!(apply_role_change(&db, "owner", everyone(perm::SEND_MESSAGES)).unwrap(), Ok(()));
-        assert_eq!(apply_role_change(&db, "owner", everyone(0)).unwrap(), Err(EVERYONE_KEEPS.into()));
-    }
-}
-
-#[cfg(test)]
-mod badge_tests {
-    use super::*;
-
-    #[test]
-    fn badges_are_unique_by_name_and_deleting_one_takes_it_from_members() {
-        let db = Db::open(":memory:").unwrap();
-        db.add_member("bob", "Bob", 1).unwrap();
-        let helper = db.create_badge("Helper", "#2ecc71").unwrap().expect("made");
-        assert!(db.create_badge("Helper", "#000000").unwrap().is_none(), "the name is taken");
-        db.set_member_badge("bob", helper, true).unwrap();
-        assert_eq!(db.all_member_badges().unwrap().get("bob"), Some(&vec![helper]));
-        assert!(db.delete_badge(helper).unwrap());
-        assert!(db.badge_list().unwrap().is_empty());
-        assert!(db.all_member_badges().unwrap().get("bob").is_none());
-    }
-}
+#[path = "tests/main.rs"]
+mod tests;

@@ -143,7 +143,9 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::R
 }
 
 fn self_id_missing(conn: &Connection) -> rusqlite::Result<bool> {
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM server_info WHERE key = 'server_id'", [], |row| row.get(0))?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM server_info WHERE key = 'server_id'", [], |row| {
+        row.get(0)
+    })?;
     Ok(count == 0)
 }
 
@@ -157,7 +159,12 @@ pub fn is_legacy_id(id: &str) -> bool {
 /// The overrides gained Manage channels and Manage messages after they first existed, so older
 /// databases get the two columns added.
 fn add_manage_columns(conn: &Connection) -> rusqlite::Result<()> {
-    for table in ["channel_overrides", "category_overrides", "channel_member_overrides", "category_member_overrides"] {
+    for table in [
+        "channel_overrides",
+        "category_overrides",
+        "channel_member_overrides",
+        "category_member_overrides",
+    ] {
         let columns: Vec<String> = conn
             .prepare(&format!("PRAGMA table_info({table})"))?
             .query_map([], |row| row.get::<_, String>(1))?
@@ -184,16 +191,28 @@ fn setting_from_row(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<comm
 
 /// The four settings as database values, in the column order used by the override tables.
 fn setting_params(setting: common::Setting) -> [Option<i64>; 4] {
-    [setting.view, setting.send, setting.manage_channels, setting.manage_messages].map(|v| v.map(i64::from))
+    [
+        setting.view,
+        setting.send,
+        setting.manage_channels,
+        setting.manage_messages,
+    ]
+    .map(|v| v.map(i64::from))
 }
 
 fn migrate_to_ids(conn: &Connection) -> rusqlite::Result<()> {
     if table_exists(conn, "categories_v1")? {
-        conn.execute("INSERT INTO categories (name, position) SELECT name, position FROM categories_v1 ORDER BY position", [])?;
+        conn.execute(
+            "INSERT INTO categories (name, position) SELECT name, position FROM categories_v1 ORDER BY position",
+            [],
+        )?;
         conn.execute("DROP TABLE categories_v1", [])?;
     }
     if table_exists(conn, "channels_v1")? {
-        conn.execute("INSERT OR IGNORE INTO channels (name) SELECT name FROM channels_v1 ORDER BY name", [])?;
+        conn.execute(
+            "INSERT OR IGNORE INTO channels (name) SELECT name FROM channels_v1 ORDER BY name",
+            [],
+        )?;
         if table_has_column(conn, "channels_v1", "category")? {
             conn.execute(
                 "UPDATE channels SET category_id = (
@@ -226,7 +245,11 @@ impl Db {
         )?;
         // Give @everyone View channels and Message channels once, for servers made before they existed.
         // The flag keeps a later change by the owner from being undone at the next start.
-        if conn.execute("INSERT OR IGNORE INTO server_info (key, value) VALUES ('everyone_channel_perms', '1')", [])? == 1 {
+        if conn.execute(
+            "INSERT OR IGNORE INTO server_info (key, value) VALUES ('everyone_channel_perms', '1')",
+            [],
+        )? == 1
+        {
             conn.execute(
                 "UPDATE roles SET permissions = permissions | ?1 WHERE id = 0",
                 params![(common::perm::VIEW_CHANNEL | common::perm::SEND_MESSAGES) as i64],
@@ -234,11 +257,17 @@ impl Db {
         }
         migrate_to_ids(&conn)?;
         // Direct messages made before cross-server ones lack this column; they are all local.
-        let _ = conn.execute("ALTER TABLE direct_messages ADD COLUMN cross INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute(
+            "ALTER TABLE direct_messages ADD COLUMN cross INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         // Databases made before messages could be edited lack this column.
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0", []);
         // Roles made before pings and member-list groups lack these columns.
-        let _ = conn.execute("ALTER TABLE roles ADD COLUMN mentionable INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute(
+            "ALTER TABLE roles ADD COLUMN mentionable INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE roles ADD COLUMN hoisted INTEGER NOT NULL DEFAULT 0", []);
         // Members get a display name separate from their id. Older databases lack it.
         let _ = conn.execute("ALTER TABLE members ADD COLUMN display TEXT", []);
@@ -246,7 +275,10 @@ impl Db {
         // Messages made before they named their channel by ID lack this column.
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN channel_id INTEGER", []);
         // Channels made before they could be ordered lack this column; they keep their name order.
-        let _ = conn.execute("ALTER TABLE channels ADD COLUMN position INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute(
+            "ALTER TABLE channels ADD COLUMN position INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         // The server's own ID, made once and kept. Clients recognise the server by it, so the server
         // stays the same when its address changes.
         if self_id_missing(&conn)? {
@@ -312,7 +344,10 @@ impl Db {
                     conn.execute("INSERT OR IGNORE INTO channels (name) VALUES (?1)", params![channel])?;
                 }
             }
-            conn.execute("INSERT INTO server_info (key, value) VALUES ('channels_seeded', '1')", [])?;
+            conn.execute(
+                "INSERT INTO server_info (key, value) VALUES ('channels_seeded', '1')",
+                [],
+            )?;
         }
         // Every message names its channel by ID. Channels with messages but no row (direct messages)
         // get one here.
@@ -338,10 +373,8 @@ impl Db {
             "INSERT OR IGNORE INTO members (name, first_seen) VALUES (?1, ?2)",
             params![id, now as i64],
         )?;
-        self.conn.execute(
-            "UPDATE members SET display = ?2 WHERE name = ?1",
-            params![id, display],
-        )?;
+        self.conn
+            .execute("UPDATE members SET display = ?2 WHERE name = ?1", params![id, display])?;
         self.conn.execute(
             "INSERT OR IGNORE INTO server_info (key, value) VALUES ('owner', ?1)",
             params![id],
@@ -352,7 +385,9 @@ impl Db {
     /// When each member first joined this server, by id, in Unix seconds.
     pub fn first_seen_all(&self) -> rusqlite::Result<std::collections::HashMap<String, u64>> {
         let mut stmt = self.conn.prepare("SELECT name, first_seen FROM members")?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?.max(0) as u64)))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?.max(0) as u64))
+        })?;
         rows.collect()
     }
 
@@ -381,11 +416,11 @@ impl Db {
 
     /// Whether this server has a member with this account id.
     pub fn is_member(&self, id: &str) -> rusqlite::Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM members WHERE name = ?1",
-            params![id],
-            |row| row.get(0),
-        )?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM members WHERE name = ?1", params![id], |row| {
+                row.get(0)
+            })?;
         Ok(count > 0)
     }
 
@@ -404,15 +439,16 @@ impl Db {
 
     /// Whether a direct message has a member who is not on this server. Such a conversation is
     /// kept in step with the other server, so it cannot be edited, deleted or reacted to.
-    pub fn is_cross_server_dm(&self, channel: &str) -> rusqlite::Result<bool> {
+    pub fn cross_server_dm(&self, channel: &str) -> rusqlite::Result<bool> {
         let Some(id) = channel.strip_prefix("dm-").and_then(|n| n.parse::<i64>().ok()) else {
             return Ok(false);
         };
-        let cross: i64 = self.conn.query_row(
-            "SELECT cross FROM direct_messages WHERE id = ?1",
-            params![id],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let cross: i64 = self
+            .conn
+            .query_row("SELECT cross FROM direct_messages WHERE id = ?1", params![id], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
         Ok(cross != 0)
     }
 
@@ -434,7 +470,7 @@ impl Db {
     }
 
     /// Whether `user` is one of the two members of a direct message channel.
-    pub fn is_direct_message_member(&self, channel: &str, user: &str) -> rusqlite::Result<bool> {
+    pub fn is_dm_member(&self, channel: &str, user: &str) -> rusqlite::Result<bool> {
         let Some(id) = channel.strip_prefix("dm-").and_then(|n| n.parse::<i64>().ok()) else {
             return Ok(false);
         };
@@ -469,7 +505,7 @@ impl Db {
     }
 
     /// The member whose display name is `display`, if there is one.
-    pub fn member_by_display_name(&self, display: &str) -> rusqlite::Result<Option<String>> {
+    pub fn member_by_display(&self, display: &str) -> rusqlite::Result<Option<String>> {
         use rusqlite::OptionalExtension;
         self.conn
             .query_row(
@@ -484,7 +520,9 @@ impl Db {
     pub fn message_channel(&self, id: i64) -> rusqlite::Result<Option<String>> {
         use rusqlite::OptionalExtension;
         self.conn
-            .query_row("SELECT channel FROM messages WHERE id = ?1", params![id], |row| row.get(0))
+            .query_row("SELECT channel FROM messages WHERE id = ?1", params![id], |row| {
+                row.get(0)
+            })
             .optional()
     }
 
@@ -492,7 +530,9 @@ impl Db {
     pub fn message_channel_id(&self, id: i64) -> rusqlite::Result<Option<i64>> {
         use rusqlite::OptionalExtension;
         self.conn
-            .query_row("SELECT channel_id FROM messages WHERE id = ?1", params![id], |row| row.get(0))
+            .query_row("SELECT channel_id FROM messages WHERE id = ?1", params![id], |row| {
+                row.get(0)
+            })
             .optional()
             .map(|c: Option<Option<i64>>| c.flatten())
     }
@@ -500,17 +540,18 @@ impl Db {
     pub fn owner(&self) -> rusqlite::Result<Option<String>> {
         use rusqlite::OptionalExtension;
         self.conn
-            .query_row("SELECT value FROM server_info WHERE key = 'owner'", [], |row| row.get(0))
+            .query_row("SELECT value FROM server_info WHERE key = 'owner'", [], |row| {
+                row.get(0)
+            })
             .optional()
     }
 
     /// The name everyone sees for this server.
     pub fn server_name(&self) -> rusqlite::Result<String> {
-        self.conn.query_row(
-            "SELECT value FROM server_info WHERE key = 'server_name'",
-            [],
-            |row| row.get(0),
-        )
+        self.conn
+            .query_row("SELECT value FROM server_info WHERE key = 'server_name'", [], |row| {
+                row.get(0)
+            })
     }
 
     pub fn server_description(&self) -> rusqlite::Result<String> {
@@ -523,11 +564,11 @@ impl Db {
 
     /// The server icon as base64 PNG, or `None` when the server has no icon.
     pub fn server_icon(&self) -> rusqlite::Result<Option<String>> {
-        let icon: String = self.conn.query_row(
-            "SELECT value FROM server_info WHERE key = 'server_icon'",
-            [],
-            |row| row.get(0),
-        )?;
+        let icon: String =
+            self.conn
+                .query_row("SELECT value FROM server_info WHERE key = 'server_icon'", [], |row| {
+                    row.get(0)
+                })?;
         Ok(if icon.is_empty() { None } else { Some(icon) })
     }
 
@@ -547,13 +588,16 @@ impl Db {
     pub fn info_value(&self, key: &str) -> rusqlite::Result<Option<String>> {
         use rusqlite::OptionalExtension;
         self.conn
-            .query_row("SELECT value FROM server_info WHERE key = ?1", params![key], |row| row.get(0))
+            .query_row("SELECT value FROM server_info WHERE key = ?1", params![key], |row| {
+                row.get(0)
+            })
             .optional()
     }
 
     /// Forgets the auth service certificates this server remembers. Returns how many were removed.
     pub fn forget_auth_pins(&self) -> rusqlite::Result<usize> {
-        self.conn.execute("DELETE FROM server_info WHERE key LIKE 'pin:auth:%'", [])
+        self.conn
+            .execute("DELETE FROM server_info WHERE key LIKE 'pin:auth:%'", [])
     }
 
     pub fn set_server_info(&self, key: &str, value: &str) -> rusqlite::Result<()> {
@@ -567,11 +611,11 @@ impl Db {
 
     /// True once another server has got in touch with this one, so other servers know it.
     pub fn is_public(&self) -> rusqlite::Result<bool> {
-        let value: String = self.conn.query_row(
-            "SELECT value FROM server_info WHERE key = 'public'",
-            [],
-            |row| row.get(0),
-        )?;
+        let value: String = self
+            .conn
+            .query_row("SELECT value FROM server_info WHERE key = 'public'", [], |row| {
+                row.get(0)
+            })?;
         Ok(value == "1")
     }
 
@@ -616,7 +660,13 @@ impl Db {
             .query_row(
                 "SELECT COALESCE(id, name), name, verified FROM session_cache WHERE token = ?1",
                 params![token],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)? as u64)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? as u64,
+                    ))
+                },
             )
             .optional()?;
         Ok(row)
@@ -630,9 +680,9 @@ impl Db {
 
     /// Everyone who has been a member, including anyone who has posted a message.
     pub fn member_names(&self) -> rusqlite::Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT name FROM members UNION SELECT author FROM messages ORDER BY 1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM members UNION SELECT author FROM messages ORDER BY 1")?;
         let names = stmt.query_map([], |row| row.get(0))?;
         names.collect()
     }
@@ -651,33 +701,47 @@ impl Db {
     /// The id of the channel with this name, if there is one.
     pub fn channel_id(&self, name: &str) -> rusqlite::Result<Option<i64>> {
         use rusqlite::OptionalExtension;
-        self.conn.query_row("SELECT id FROM channels WHERE name = ?1", params![name], |row| row.get(0)).optional()
+        self.conn
+            .query_row("SELECT id FROM channels WHERE name = ?1", params![name], |row| {
+                row.get(0)
+            })
+            .optional()
     }
 
     /// The current name of a channel, if it exists.
     pub fn channel_name(&self, id: i64) -> rusqlite::Result<Option<String>> {
         use rusqlite::OptionalExtension;
-        self.conn.query_row("SELECT name FROM channels WHERE id = ?1", params![id], |row| row.get(0)).optional()
+        self.conn
+            .query_row("SELECT name FROM channels WHERE id = ?1", params![id], |row| row.get(0))
+            .optional()
     }
 
     /// Every ordinary channel, by name. Direct messages have channel rows too, but they are not
     /// listed with the channels.
     pub fn channel_list(&self) -> rusqlite::Result<Vec<common::ChannelRef>> {
-        let mut stmt = self.conn.prepare("SELECT id, name FROM channels WHERE name NOT LIKE 'dm-%' ORDER BY position, name")?;
-        let rows = stmt.query_map([], |row| Ok(common::ChannelRef { id: row.get(0)?, name: row.get(1)? }))?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name FROM channels WHERE name NOT LIKE 'dm-%' ORDER BY position, name")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(common::ChannelRef {
+                id: row.get(0)?,
+                name: row.get(1)?,
+            })
+        })?;
         rows.collect()
     }
 
     /// Adds a category. Returns its id, or `None` when one with that name already exists.
     pub fn create_category(&self, name: &str) -> rusqlite::Result<Option<i64>> {
-        let position: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(position), 0) + 1 FROM categories",
-            [],
-            |row| row.get(0),
+        let position: i64 =
+            self.conn
+                .query_row("SELECT COALESCE(MAX(position), 0) + 1 FROM categories", [], |row| {
+                    row.get(0)
+                })?;
+        let added = self.conn.execute(
+            "INSERT OR IGNORE INTO categories (name, position) VALUES (?1, ?2)",
+            params![name, position],
         )?;
-        let added = self
-            .conn
-            .execute("INSERT OR IGNORE INTO categories (name, position) VALUES (?1, ?2)", params![name, position])?;
         if added == 0 {
             return Ok(None);
         }
@@ -687,15 +751,26 @@ impl Db {
     /// Removes a category. Its channels are kept and become uncategorized. Returns false when there
     /// was no such category.
     pub fn delete_category(&self, id: i64) -> rusqlite::Result<bool> {
-        self.conn.execute("DELETE FROM category_overrides WHERE category_id = ?1", params![id])?;
-        self.conn.execute("DELETE FROM category_member_overrides WHERE category_id = ?1", params![id])?;
-        self.conn.execute("UPDATE channels SET category_id = NULL WHERE category_id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM category_overrides WHERE category_id = ?1", params![id])?;
+        self.conn.execute(
+            "DELETE FROM category_member_overrides WHERE category_id = ?1",
+            params![id],
+        )?;
+        self.conn.execute(
+            "UPDATE channels SET category_id = NULL WHERE category_id = ?1",
+            params![id],
+        )?;
         let removed = self.conn.execute("DELETE FROM categories WHERE id = ?1", params![id])?;
         Ok(removed > 0)
     }
 
     pub fn category_exists(&self, id: i64) -> rusqlite::Result<bool> {
-        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM categories WHERE id = ?1", params![id], |row| row.get(0))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM categories WHERE id = ?1", params![id], |row| {
+                row.get(0)
+            })?;
         Ok(count > 0)
     }
 
@@ -717,7 +792,13 @@ impl Db {
     pub fn channel_category(&self, channel: i64) -> rusqlite::Result<Option<i64>> {
         let found: Option<Option<i64>> = {
             use rusqlite::OptionalExtension;
-            self.conn.query_row("SELECT category_id FROM channels WHERE id = ?1", params![channel], |row| row.get(0)).optional()?
+            self.conn
+                .query_row(
+                    "SELECT category_id FROM channels WHERE id = ?1",
+                    params![channel],
+                    |row| row.get(0),
+                )
+                .optional()?
         };
         Ok(found.flatten())
     }
@@ -726,13 +807,17 @@ impl Db {
     /// Moving within a category, or out of one, leaves them alone.
     fn sync_to_category(&self, channel: i64, before: Option<i64>, after: Option<i64>) -> rusqlite::Result<()> {
         if let Some(category) = after.filter(|c| before != Some(*c)) {
-            self.conn.execute("DELETE FROM channel_overrides WHERE channel_id = ?1", params![channel])?;
+            self.conn
+                .execute("DELETE FROM channel_overrides WHERE channel_id = ?1", params![channel])?;
             self.conn.execute(
                 "INSERT INTO channel_overrides (channel_id, role_id, view, send, manage_channels, manage_messages)
                  SELECT ?1, role_id, view, send, manage_channels, manage_messages FROM category_overrides WHERE category_id = ?2",
                 params![channel, category],
             )?;
-            self.conn.execute("DELETE FROM channel_member_overrides WHERE channel_id = ?1", params![channel])?;
+            self.conn.execute(
+                "DELETE FROM channel_member_overrides WHERE channel_id = ?1",
+                params![channel],
+            )?;
             self.conn.execute(
                 "INSERT INTO channel_member_overrides (channel_id, member_id, view, send, manage_channels, manage_messages)
                  SELECT ?1, member_id, view, send, manage_channels, manage_messages FROM category_member_overrides WHERE category_id = ?2",
@@ -794,9 +879,17 @@ impl Db {
     }
 
     /// Sets a member's permission for a channel. Both `None` removes it.
-    pub fn set_channel_member_override(&self, channel_id: i64, member: &str, setting: common::Setting) -> rusqlite::Result<()> {
+    pub fn member_channel_override(
+        &self,
+        channel_id: i64,
+        member: &str,
+        setting: common::Setting,
+    ) -> rusqlite::Result<()> {
         if setting.is_empty() {
-            self.conn.execute("DELETE FROM channel_member_overrides WHERE channel_id = ?1 AND member_id = ?2", params![channel_id, member])?;
+            self.conn.execute(
+                "DELETE FROM channel_member_overrides WHERE channel_id = ?1 AND member_id = ?2",
+                params![channel_id, member],
+            )?;
         } else {
             let [view, send, manage_channels, manage_messages] = setting_params(setting);
             self.conn.execute(
@@ -808,9 +901,17 @@ impl Db {
     }
 
     /// Sets a member's permission for a category and for each channel in it. Both `None` removes it.
-    pub fn set_category_member_override(&self, category: i64, member: &str, setting: common::Setting) -> rusqlite::Result<()> {
+    pub fn member_category_override(
+        &self,
+        category: i64,
+        member: &str,
+        setting: common::Setting,
+    ) -> rusqlite::Result<()> {
         if setting.is_empty() {
-            self.conn.execute("DELETE FROM category_member_overrides WHERE category_id = ?1 AND member_id = ?2", params![category, member])?;
+            self.conn.execute(
+                "DELETE FROM category_member_overrides WHERE category_id = ?1 AND member_id = ?2",
+                params![category, member],
+            )?;
         } else {
             let [view, send, manage_channels, manage_messages] = setting_params(setting);
             self.conn.execute(
@@ -819,9 +920,11 @@ impl Db {
             )?;
         }
         let mut stmt = self.conn.prepare("SELECT id FROM channels WHERE category_id = ?1")?;
-        let channels: Vec<i64> = stmt.query_map(params![category], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let channels: Vec<i64> = stmt
+            .query_map(params![category], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         for channel in channels {
-            self.set_channel_member_override(channel, member, setting)?;
+            self.member_channel_override(channel, member, setting)?;
         }
         Ok(())
     }
@@ -829,7 +932,10 @@ impl Db {
     /// Sets a role's permission for a category and for each channel in it. Both `None` removes it.
     pub fn set_category_override(&self, category: i64, role: i64, setting: common::Setting) -> rusqlite::Result<()> {
         if setting.is_empty() {
-            self.conn.execute("DELETE FROM category_overrides WHERE category_id = ?1 AND role_id = ?2", params![category, role])?;
+            self.conn.execute(
+                "DELETE FROM category_overrides WHERE category_id = ?1 AND role_id = ?2",
+                params![category, role],
+            )?;
         } else {
             let [view, send, manage_channels, manage_messages] = setting_params(setting);
             self.conn.execute(
@@ -838,7 +944,9 @@ impl Db {
             )?;
         }
         let mut stmt = self.conn.prepare("SELECT id FROM channels WHERE category_id = ?1")?;
-        let channels: Vec<i64> = stmt.query_map(params![category], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let channels: Vec<i64> = stmt
+            .query_map(params![category], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         for channel in channels {
             self.set_channel_override(channel, role, setting)?;
         }
@@ -852,24 +960,34 @@ impl Db {
         use rusqlite::OptionalExtension;
         let exists: Option<i64> = self
             .conn
-            .query_row("SELECT id FROM channels WHERE id = ?1", params![channel], |row| row.get(0))
+            .query_row("SELECT id FROM channels WHERE id = ?1", params![channel], |row| {
+                row.get(0)
+            })
             .optional()?;
         if exists.is_none() {
             return Ok(false);
         }
         let previous = self.channel_category(channel)?;
-        self.conn.execute("UPDATE channels SET category_id = ?2 WHERE id = ?1", params![channel, category])?;
-        self.sync_to_category(channel, previous, category)?;
-        let mut stmt = self.conn.prepare(
-            "SELECT id FROM channels WHERE category_id IS ?1 AND id != ?2 ORDER BY position, name",
+        self.conn.execute(
+            "UPDATE channels SET category_id = ?2 WHERE id = ?1",
+            params![channel, category],
         )?;
+        self.sync_to_category(channel, previous, category)?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM channels WHERE category_id IS ?1 AND id != ?2 ORDER BY position, name")?;
         let mut order: Vec<i64> = stmt
             .query_map(params![category, channel], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        let at = before.and_then(|b| order.iter().position(|&c| c == b)).unwrap_or(order.len());
+        let at = before
+            .and_then(|b| order.iter().position(|&c| c == b))
+            .unwrap_or(order.len());
         order.insert(at, channel);
         for (i, id) in order.iter().enumerate() {
-            self.conn.execute("UPDATE channels SET position = ?2 WHERE id = ?1", params![id, i as i64 + 1])?;
+            self.conn.execute(
+                "UPDATE channels SET position = ?2 WHERE id = ?1",
+                params![id, i as i64 + 1],
+            )?;
         }
         Ok(true)
     }
@@ -879,7 +997,12 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, name FROM channels WHERE category_id IS NULL AND name NOT LIKE 'dm-%' ORDER BY position, name",
         )?;
-        let rows = stmt.query_map([], |row| Ok(common::ChannelRef { id: row.get(0)?, name: row.get(1)? }))?;
+        let rows = stmt.query_map([], |row| {
+            Ok(common::ChannelRef {
+                id: row.get(0)?,
+                name: row.get(1)?,
+            })
+        })?;
         rows.collect()
     }
 
@@ -894,7 +1017,8 @@ impl Db {
             &format!("DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE {matches})"),
             params![id, name],
         )?;
-        self.conn.execute(&format!("DELETE FROM messages WHERE {matches}"), params![id, name])?;
+        self.conn
+            .execute(&format!("DELETE FROM messages WHERE {matches}"), params![id, name])?;
         Ok(self.conn.execute("DELETE FROM channels WHERE id = ?1", params![id])? > 0)
     }
 
@@ -953,12 +1077,21 @@ impl Db {
         let tx = self.conn.unchecked_transaction()?;
         let mut changed = 0;
         for (old, new) in pairs {
-            changed += tx.execute("UPDATE OR IGNORE members SET name = ?2 WHERE name = ?1", params![old, new])?;
+            changed += tx.execute(
+                "UPDATE OR IGNORE members SET name = ?2 WHERE name = ?1",
+                params![old, new],
+            )?;
             changed += tx.execute("UPDATE messages SET author = ?2 WHERE author = ?1", params![old, new])?;
             changed += tx.execute("UPDATE reactions SET user = ?2 WHERE user = ?1", params![old, new])?;
             changed += tx.execute("UPDATE OR IGNORE people SET id = ?2 WHERE id = ?1", params![old, new])?;
-            changed += tx.execute("UPDATE server_info SET value = ?2 WHERE key = 'owner' AND value = ?1", params![old, new])?;
-            changed += tx.execute("UPDATE OR IGNORE session_cache SET id = ?2 WHERE id = ?1", params![old, new])?;
+            changed += tx.execute(
+                "UPDATE server_info SET value = ?2 WHERE key = 'owner' AND value = ?1",
+                params![old, new],
+            )?;
+            changed += tx.execute(
+                "UPDATE OR IGNORE session_cache SET id = ?2 WHERE id = ?1",
+                params![old, new],
+            )?;
             // A direct message is stored with its two members in order, so the pair is put back in order.
             let rows: Vec<(i64, String, String)> = {
                 let mut stmt = tx.prepare("SELECT id, a, b FROM direct_messages WHERE a = ?1 OR b = ?1")?;
@@ -969,7 +1102,10 @@ impl Db {
                 let a = if a == *old { new.clone() } else { a };
                 let b = if b == *old { new.clone() } else { b };
                 let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                changed += tx.execute("UPDATE OR IGNORE direct_messages SET a = ?2, b = ?3 WHERE id = ?1", params![id, lo, hi])?;
+                changed += tx.execute(
+                    "UPDATE OR IGNORE direct_messages SET a = ?2, b = ?3 WHERE id = ?1",
+                    params![id, lo, hi],
+                )?;
             }
         }
         tx.commit()?;
@@ -987,7 +1123,9 @@ impl Db {
         if taken > 0 {
             return Ok(false);
         }
-        let changed = self.conn.execute("UPDATE channels SET name = ?2 WHERE id = ?1", params![id, new])?;
+        let changed = self
+            .conn
+            .execute("UPDATE channels SET name = ?2 WHERE id = ?1", params![id, new])?;
         Ok(changed > 0)
     }
 
@@ -1001,19 +1139,32 @@ impl Db {
         if taken > 0 {
             return Ok(false);
         }
-        let changed = self.conn.execute("UPDATE categories SET name = ?2 WHERE id = ?1", params![id, new])?;
+        let changed = self
+            .conn
+            .execute("UPDATE categories SET name = ?2 WHERE id = ?1", params![id, new])?;
         Ok(changed > 0)
     }
 
     /// Every category in order, with its channels.
     pub fn categories(&self) -> rusqlite::Result<Vec<common::CategoryInfo>> {
-        let mut stmt = self.conn.prepare("SELECT id, name FROM categories ORDER BY position, name")?;
-        let cats: Vec<(i64, String)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name FROM categories ORDER BY position, name")?;
+        let cats: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
         let mut out = Vec::new();
         for (id, name) in cats {
-            let mut stmt = self.conn.prepare("SELECT id, name FROM channels WHERE category_id = ?1 ORDER BY position, name")?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, name FROM channels WHERE category_id = ?1 ORDER BY position, name")?;
             let channels = stmt
-                .query_map(params![id], |row| Ok(common::ChannelRef { id: row.get(0)?, name: row.get(1)? }))?
+                .query_map(params![id], |row| {
+                    Ok(common::ChannelRef {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                    })
+                })?
                 .collect::<rusqlite::Result<_>>()?;
             out.push(common::CategoryInfo { id, name, channels });
         }
@@ -1026,7 +1177,8 @@ impl Db {
     pub fn statuses(&self) -> rusqlite::Result<std::collections::HashMap<String, common::PresenceStatus>> {
         let mut stmt = self.conn.prepare("SELECT user_id, status FROM user_status")?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-        rows.map(|r| r.map(|(id, key)| (id, common::PresenceStatus::from_key(&key)))).collect()
+        rows.map(|r| r.map(|(id, key)| (id, common::PresenceStatus::from_key(&key))))
+            .collect()
     }
 
     pub fn set_status(&self, user: &str, status: common::PresenceStatus) -> rusqlite::Result<()> {
@@ -1064,7 +1216,10 @@ impl Db {
     /// Sets a role's exception for a channel. Both `None` removes it.
     pub fn set_channel_override(&self, channel_id: i64, role: i64, setting: common::Setting) -> rusqlite::Result<()> {
         if setting.is_empty() {
-            self.conn.execute("DELETE FROM channel_overrides WHERE channel_id = ?1 AND role_id = ?2", params![channel_id, role])?;
+            self.conn.execute(
+                "DELETE FROM channel_overrides WHERE channel_id = ?1 AND role_id = ?2",
+                params![channel_id, role],
+            )?;
         } else {
             let [view, send, manage_channels, manage_messages] = setting_params(setting);
             self.conn.execute(
@@ -1094,7 +1249,14 @@ impl Db {
     }
 
     /// Adds a role at the bottom of the hierarchy. Returns its id, or `None` when the name is taken.
-    pub fn create_role(&self, name: &str, color: &str, permissions: u32, mentionable: bool, hoisted: bool) -> rusqlite::Result<Option<i64>> {
+    pub fn create_role(
+        &self,
+        name: &str,
+        color: &str,
+        permissions: u32,
+        mentionable: bool,
+        hoisted: bool,
+    ) -> rusqlite::Result<Option<i64>> {
         // Above @everyone, which sits at the very bottom.
         let position: i64 = self.conn.query_row(
             "SELECT COALESCE(MIN(position), 1) - 1 FROM roles WHERE id != 0",
@@ -1119,7 +1281,15 @@ impl Db {
     }
 
     /// Changes a role's name, colour and permissions. Returns false when there is no such role.
-    pub fn update_role(&self, id: i64, name: &str, color: &str, permissions: u32, mentionable: bool, hoisted: bool) -> rusqlite::Result<bool> {
+    pub fn update_role(
+        &self,
+        id: i64,
+        name: &str,
+        color: &str,
+        permissions: u32,
+        mentionable: bool,
+        hoisted: bool,
+    ) -> rusqlite::Result<bool> {
         let changed = self.conn.execute(
             "UPDATE roles SET name = ?2, color = ?3, permissions = ?4, mentionable = ?5, hoisted = ?6 WHERE id = ?1",
             params![id, name, color, permissions as i64, mentionable as i64, hoisted as i64],
@@ -1129,7 +1299,8 @@ impl Db {
 
     /// Removes a role and takes it from everyone who had it. Returns false when there is no such role.
     pub fn delete_role(&self, id: i64) -> rusqlite::Result<bool> {
-        self.conn.execute("DELETE FROM member_roles WHERE role_id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM member_roles WHERE role_id = ?1", params![id])?;
         Ok(self.conn.execute("DELETE FROM roles WHERE id = ?1", params![id])? > 0)
     }
 
@@ -1162,7 +1333,9 @@ impl Db {
 
     /// The ids of the roles a member has.
     pub fn member_role_ids(&self, user: &str) -> rusqlite::Result<Vec<i64>> {
-        let mut stmt = self.conn.prepare("SELECT role_id FROM member_roles WHERE user_id = ?1")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT role_id FROM member_roles WHERE user_id = ?1")?;
         let ids = stmt.query_map(params![user], |row| row.get(0))?;
         ids.collect()
     }
@@ -1182,34 +1355,54 @@ impl Db {
     /// Every badge on this server, oldest first.
     pub fn badge_list(&self) -> rusqlite::Result<Vec<common::Badge>> {
         let mut stmt = self.conn.prepare("SELECT id, name, color FROM badges ORDER BY id")?;
-        let rows = stmt.query_map([], |row| Ok(common::Badge { id: row.get(0)?, name: row.get(1)?, color: row.get(2)? }))?;
+        let rows = stmt.query_map([], |row| {
+            Ok(common::Badge {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                color: row.get(2)?,
+            })
+        })?;
         rows.collect()
     }
 
     /// Creates a badge. Returns None when the name is already taken.
     pub fn create_badge(&self, name: &str, color: &str) -> rusqlite::Result<Option<i64>> {
-        let added = self.conn.execute("INSERT OR IGNORE INTO badges (name, color) VALUES (?1, ?2)", params![name, color])?;
+        let added = self.conn.execute(
+            "INSERT OR IGNORE INTO badges (name, color) VALUES (?1, ?2)",
+            params![name, color],
+        )?;
         Ok((added > 0).then(|| self.conn.last_insert_rowid()))
     }
 
     /// Whether a badge with this id exists.
     pub fn badge_exists(&self, id: i64) -> rusqlite::Result<bool> {
-        let found: i64 = self.conn.query_row("SELECT COUNT(*) FROM badges WHERE id = ?1", params![id], |row| row.get(0))?;
+        let found: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM badges WHERE id = ?1", params![id], |row| {
+                row.get(0)
+            })?;
         Ok(found > 0)
     }
 
     /// Removes a badge and takes it from everyone who had it. Returns false when there is no such badge.
     pub fn delete_badge(&self, id: i64) -> rusqlite::Result<bool> {
-        self.conn.execute("DELETE FROM member_badges WHERE badge_id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM member_badges WHERE badge_id = ?1", params![id])?;
         Ok(self.conn.execute("DELETE FROM badges WHERE id = ?1", params![id])? > 0)
     }
 
     /// Gives a member a badge, or takes it away.
     pub fn set_member_badge(&self, user: &str, badge: i64, on: bool) -> rusqlite::Result<()> {
         if on {
-            self.conn.execute("INSERT OR IGNORE INTO member_badges (user_id, badge_id) VALUES (?1, ?2)", params![user, badge])?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO member_badges (user_id, badge_id) VALUES (?1, ?2)",
+                params![user, badge],
+            )?;
         } else {
-            self.conn.execute("DELETE FROM member_badges WHERE user_id = ?1 AND badge_id = ?2", params![user, badge])?;
+            self.conn.execute(
+                "DELETE FROM member_badges WHERE user_id = ?1 AND badge_id = ?2",
+                params![user, badge],
+            )?;
         }
         Ok(())
     }
@@ -1250,7 +1443,8 @@ impl Db {
             )
             .optional()?;
         if channel.is_some() {
-            self.conn.execute("DELETE FROM reactions WHERE message_id = ?1", params![id])?;
+            self.conn
+                .execute("DELETE FROM reactions WHERE message_id = ?1", params![id])?;
             self.conn.execute("DELETE FROM messages WHERE id = ?1", params![id])?;
         }
         Ok(channel)
@@ -1268,7 +1462,9 @@ impl Db {
         use rusqlite::OptionalExtension;
         let channel: Option<i64> = self
             .conn
-            .query_row("SELECT channel_id FROM messages WHERE id = ?1", params![id], |row| row.get(0))
+            .query_row("SELECT channel_id FROM messages WHERE id = ?1", params![id], |row| {
+                row.get(0)
+            })
             .optional()?;
         let Some(channel) = channel else {
             return Ok(None);
@@ -1283,7 +1479,10 @@ impl Db {
                 params![id, emoji, user],
             )?;
         }
-        Ok(Some((channel, self.reactions_for(&[id])?.remove(&id).unwrap_or_default())))
+        Ok(Some((
+            channel,
+            self.reactions_for(&[id])?.remove(&id).unwrap_or_default(),
+        )))
     }
 
     /// Reactions for the given messages, keyed by message id. Each emoji appears once, in the
@@ -1298,7 +1497,13 @@ impl Db {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT message_id, emoji, user FROM reactions WHERE message_id IN ({list}) ORDER BY rowid"
         ))?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
         for row in rows {
             let (message, emoji, user) = row?;
             // Show the reactor's name, not their id.
@@ -1306,7 +1511,10 @@ impl Db {
             let reactions = out.entry(message).or_default();
             match reactions.iter_mut().find(|r| r.emoji == emoji) {
                 Some(r) => r.users.push(user),
-                None => reactions.push(common::Reaction { emoji, users: vec![user] }),
+                None => reactions.push(common::Reaction {
+                    emoji,
+                    users: vec![user],
+                }),
             }
         }
         Ok(out)
@@ -1324,7 +1532,9 @@ impl Db {
             return Ok(None);
         }
         self.conn
-            .query_row("SELECT channel_id FROM messages WHERE id = ?1", params![id], |row| row.get(0))
+            .query_row("SELECT channel_id FROM messages WHERE id = ?1", params![id], |row| {
+                row.get(0)
+            })
             .optional()
     }
 
@@ -1366,393 +1576,5 @@ impl Db {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A message in a channel, by its name. The channel is created if needed.
-    fn message(db: &Db, channel: &str, author: &str, text: &str) -> ChatMessage {
-        ChatMessage {
-            id: 0,
-            channel_id: db.ensure_channel(channel).unwrap(),
-            channel: channel.into(),
-            author: author.into(),
-            author_id: author.into(),
-            text: text.into(),
-            timestamp: 1,
-            edited: false,
-            reactions: vec![],
-        }
-    }
-
-    #[test]
-    fn direct_messages_are_for_their_two_members_only() {
-        let db = Db::open(":memory:").unwrap();
-        db.add_member("owner", "Owner", 1).unwrap();
-        let dm = db.open_direct_message("alice", "bob").unwrap();
-        let dm_id = db.ensure_channel(&dm).unwrap();
-        let general = db.ensure_channel("general").unwrap();
-
-        let in_dm = db.save_message(&message(&db, &dm, "alice", "hi")).unwrap();
-        let in_channel = db.save_message(&message(&db, "general", "alice", "hi")).unwrap();
-
-        // The owner (not in the DM) cannot delete it; the owner can delete a channel message.
-        assert_eq!(db.delete_message(in_dm, "owner", true).unwrap(), None);
-        assert_eq!(db.delete_message(in_channel, "owner", true).unwrap(), Some(general));
-        // The author can delete their own direct message.
-        assert_eq!(db.delete_message(in_dm, "alice", false).unwrap(), Some(dm_id));
-    }
-}
-
-#[cfg(test)]
-mod category_tests {
-    use super::*;
-
-    #[test]
-    fn categories_group_channels_and_deleting_keeps_them() {
-        let db = Db::open(":memory:").unwrap();
-        let general = db.ensure_channel("general").unwrap();
-        let random = db.ensure_channel("random").unwrap();
-        let text = db.create_category("Text").unwrap().expect("created");
-        assert!(db.create_category("Text").unwrap().is_none(), "names are unique");
-        db.move_channel(general, Some(text)).unwrap();
-        db.move_channel(random, None).unwrap();
-        let cats = db.categories().unwrap();
-        assert_eq!(cats.len(), 1);
-        assert_eq!(cats[0].name, "Text");
-        assert_eq!(cats[0].channels, vec![common::ChannelRef { id: general, name: "general".into() }]);
-
-        assert!(db.delete_category(text).unwrap());
-        assert!(db.categories().unwrap().is_empty());
-        // The channel still exists and is uncategorized.
-        assert!(db.channel_list().unwrap().iter().any(|c| c.id == general));
-        assert!(!db.delete_category(text).unwrap());
-    }
-}
-
-#[cfg(test)]
-mod rename_tests {
-    use super::*;
-
-    #[test]
-    fn renaming_keeps_the_id_and_the_messages() {
-        let db = Db::open(":memory:").unwrap();
-        let general = db.ensure_channel("general").unwrap();
-        let chat = db.ensure_channel("chat").unwrap();
-        let text = db.create_category("Text").unwrap().expect("created");
-        db.move_channel(general, Some(text)).unwrap();
-        let m = ChatMessage {
-            id: 0,
-            channel_id: general,
-            channel: "general".into(),
-            author: "alice".into(),
-            author_id: "u1".into(),
-            text: "hi".into(),
-            timestamp: 1,
-            edited: false,
-            reactions: Vec::new(),
-        };
-        db.save_message(&m).unwrap();
-
-        assert!(!db.rename_channel(general, "chat").unwrap(), "the new name is taken");
-        assert!(db.rename_channel(general, "lobby").unwrap());
-        assert_eq!(db.channel_name(general).unwrap().as_deref(), Some("lobby"));
-        assert_eq!(db.channel_id("lobby").unwrap(), Some(general), "the id stays the same");
-        assert_eq!(db.history(general).unwrap().len(), 1, "messages stay with the channel");
-        assert_eq!(db.categories().unwrap()[0].channels[0].name, "lobby", "the category keeps it");
-        assert!(db.channel_list().unwrap().iter().any(|c| c.id == chat));
-    }
-
-    #[test]
-    fn deleting_a_channel_removes_its_messages_and_reorders_categories() {
-        let db = Db::open(":memory:").unwrap();
-        let general = db.ensure_channel("general").unwrap();
-        let m = ChatMessage {
-            id: 0,
-            channel_id: general,
-            channel: "general".into(),
-            author: "alice".into(),
-            author_id: "u1".into(),
-            text: "bye".into(),
-            timestamp: 1,
-            edited: false,
-            reactions: Vec::new(),
-        };
-        db.save_message(&m).unwrap();
-        assert!(db.delete_channel(general).unwrap());
-        assert!(db.channel_name(general).unwrap().is_none());
-        assert!(!db.delete_channel(general).unwrap());
-
-        let a = db.create_category("A").unwrap().unwrap();
-        let b = db.create_category("B").unwrap().unwrap();
-        let c = db.create_category("C").unwrap().unwrap();
-        assert!(db.move_category(c, Some(a)).unwrap());
-        let order: Vec<String> = db.categories().unwrap().into_iter().map(|c| c.name).collect();
-        assert_eq!(order, vec!["C", "A", "B"]);
-        assert!(db.move_category(a, None).unwrap());
-        let order: Vec<String> = db.categories().unwrap().into_iter().map(|c| c.name).collect();
-        assert_eq!(order, vec!["C", "B", "A"]);
-        assert!(!db.move_category(b, Some(b)).unwrap());
-    }
-
-    #[test]
-    fn channels_can_be_ordered_within_a_category() {
-        let db = Db::open(":memory:").unwrap();
-        let cat = db.create_category("Work").unwrap().unwrap();
-        let a = db.ensure_channel("aaa").unwrap();
-        let b = db.ensure_channel("bbb").unwrap();
-        let c = db.ensure_channel("ccc").unwrap();
-        db.move_channel(a, Some(cat)).unwrap();
-        db.move_channel(b, Some(cat)).unwrap();
-        db.move_channel(c, Some(cat)).unwrap();
-        let names = |db: &Db| -> Vec<String> {
-            db.categories().unwrap().into_iter().find(|x| x.id == cat).unwrap().channels.into_iter().map(|c| c.name).collect()
-        };
-        assert_eq!(names(&db), vec!["aaa", "bbb", "ccc"]);
-        // Drop ccc before aaa.
-        assert!(db.place_channel(c, Some(cat), Some(a)).unwrap());
-        assert_eq!(names(&db), vec!["ccc", "aaa", "bbb"]);
-        // Drop aaa at the end.
-        assert!(db.place_channel(a, Some(cat), None).unwrap());
-        assert_eq!(names(&db), vec!["ccc", "bbb", "aaa"]);
-        // Uncategorized channels keep their own order.
-        assert!(db.place_channel(b, None, None).unwrap());
-        assert!(db.uncategorized_channels().unwrap().iter().any(|x| x.id == b));
-    }
-
-    #[test]
-    fn direct_messages_are_not_listed_as_channels() {
-        let db = Db::open(":memory:").unwrap();
-        db.ensure_channel("general").unwrap();
-        let dm = db.ensure_channel("dm-9").unwrap();
-        let listed = db.channel_list().unwrap();
-        assert!(listed.iter().any(|c| c.name == "general"));
-        assert!(listed.iter().all(|c| !c.name.starts_with("dm-")), "no direct message is listed");
-        assert!(dm > 0, "the direct message still has a row for its messages");
-    }
-}
-
-#[cfg(test)]
-mod migration_tests {
-    use super::*;
-
-    /// A database in the layout from before channels and categories had IDs.
-    #[test]
-    fn an_old_database_keeps_its_channels_messages_and_categories() {
-        let path = std::env::temp_dir().join(format!("vaxelium-migrate-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE channels (name TEXT PRIMARY KEY, category TEXT);
-                 CREATE TABLE categories (name TEXT PRIMARY KEY, position INTEGER NOT NULL);
-                 CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL,
-                     author TEXT NOT NULL, text TEXT NOT NULL, timestamp INTEGER NOT NULL);
-                 INSERT INTO categories (name, position) VALUES ('Text', 1);
-                 INSERT INTO channels (name, category) VALUES ('general', 'Text'), ('random', NULL);
-                 INSERT INTO messages (channel, author, text, timestamp)
-                     VALUES ('general', 'u1', 'old message', 5), ('dm-7', 'u1', 'old dm', 6);",
-            )
-            .unwrap();
-        }
-        let db = Db::open(path.to_str().unwrap()).unwrap();
-        let general = db.channel_id("general").unwrap().expect("kept");
-        let history = db.history(general).unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].text, "old message");
-        assert_eq!(db.channel_id("dm-7").unwrap().is_some(), true, "message channels get a row");
-        let cats = db.categories().unwrap();
-        assert_eq!(cats[0].name, "Text");
-        assert_eq!(cats[0].channels[0].name, "general", "the category is kept");
-        assert!(db.info_value("server_id").unwrap().is_some(), "the server gets an id");
-        // Opening again changes nothing.
-        drop(db);
-        let db = Db::open(path.to_str().unwrap()).unwrap();
-        assert_eq!(db.categories().unwrap().len(), 1);
-        let _ = std::fs::remove_file(&path);
-    }
-}
-
-#[cfg(test)]
-mod member_id_tests {
-    use super::*;
-
-    #[test]
-    fn stored_legacy_ids_are_found_and_replaced() {
-        let db = Db::open(":memory:").unwrap();
-        db.add_member("alice", "Alice", 1).unwrap();
-        let dm = db.open_direct_message("alice", "bob").unwrap();
-        let general = db.ensure_channel("general").unwrap();
-        db.save_message(&ChatMessage {
-            id: 0,
-            channel_id: general,
-            channel: "general".into(),
-            author: "alice".into(),
-            author_id: "alice".into(),
-            text: "hi".into(),
-            timestamp: 1,
-            edited: false,
-            reactions: Vec::new(),
-        })
-        .unwrap();
-        assert!(db.legacy_ids().unwrap().contains(&"alice".to_string()));
-
-        let new_id = "0123456789abcdef0123456789abcdef".to_string();
-        let changed = db.apply_id_map(&[("alice".to_string(), new_id.clone())]).unwrap();
-        assert!(changed > 0);
-        assert!(!db.legacy_ids().unwrap().contains(&"alice".to_string()), "no old id is left");
-        assert_eq!(db.history(general).unwrap()[0].author_id, new_id, "messages follow the new id");
-        assert!(db.is_direct_message_member(&dm, &new_id).unwrap(), "direct messages follow it too");
-    }
-}
-
-#[cfg(test)]
-mod default_channel_tests {
-    use super::*;
-
-    #[test]
-    fn a_deleted_default_channel_stays_deleted_after_a_restart() {
-        let path = std::env::temp_dir().join(format!("vaxelium-defaults-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let path_str = path.to_str().unwrap();
-        {
-            let db = Db::open(path_str).unwrap();
-            assert!(db.channel_id("general").unwrap().is_some(), "a new database has the defaults");
-            let general = db.channel_id("general").unwrap().unwrap();
-            assert!(db.delete_channel(general).unwrap());
-        }
-        let db = Db::open(path_str).unwrap();
-        assert!(db.channel_id("general").unwrap().is_none(), "restarting does not bring it back");
-        let _ = std::fs::remove_file(&path);
-    }
-}
-
-#[cfg(test)]
-mod resurrect_tests {
-    use super::*;
-
-    #[test]
-    fn a_deleted_channel_is_not_recreated_from_old_messages_on_boot() {
-        let path = std::env::temp_dir().join(format!("vaxelium-resurrect-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let path_str = path.to_str().unwrap();
-        {
-            let db = Db::open(path_str).unwrap();
-            let general = db.channel_id("general").unwrap().unwrap();
-            // A message written by an older server: it has the channel's name but no channel id.
-            db.conn
-                .execute(
-                    "INSERT INTO messages (channel, author, text, timestamp) VALUES ('general', 'u1', 'old', 1)",
-                    [],
-                )
-                .unwrap();
-            assert!(db.delete_channel(general).unwrap());
-        }
-        let db = Db::open(path_str).unwrap();
-        assert!(db.channel_id("general").unwrap().is_none(), "boot brought general back");
-        let _ = std::fs::remove_file(&path);
-    }
-}
-
-#[cfg(test)]
-mod category_permission_tests {
-    use super::*;
-
-    fn everyone_view(db: &Db, channel: i64) -> Option<Option<bool>> {
-        db.channel_overrides().unwrap().into_iter().find(|o| o.channel_id == channel && o.role == common::EVERYONE_ROLE).map(|o| o.view)
-    }
-
-    #[test]
-    fn setting_a_category_permission_sets_it_on_every_channel_in_the_category() {
-        let db = Db::open(":memory:").unwrap();
-        let a = db.ensure_channel("a").unwrap();
-        let b = db.ensure_channel("b").unwrap();
-        let cat = db.create_category("Group").unwrap().expect("made");
-        db.move_channel(a, Some(cat)).unwrap();
-        db.move_channel(b, Some(cat)).unwrap();
-        db.set_category_override(cat, common::EVERYONE_ROLE, common::Setting { view: Some(false), send: None, ..Default::default() }).unwrap();
-        assert_eq!(everyone_view(&db, a), Some(Some(false)));
-        assert_eq!(everyone_view(&db, b), Some(Some(false)));
-        assert_eq!(db.category_overrides().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn a_channel_moved_into_a_category_takes_its_permissions_and_keeps_them_when_moved_out() {
-        let db = Db::open(":memory:").unwrap();
-        let c = db.ensure_channel("c").unwrap();
-        db.set_channel_override(c, common::EVERYONE_ROLE, common::Setting { view: None, send: Some(true), ..Default::default() }).unwrap();
-        let cat = db.create_category("Group").unwrap().expect("made");
-        db.set_category_override(cat, common::EVERYONE_ROLE, common::Setting { view: Some(false), send: None, ..Default::default() }).unwrap();
-        db.move_channel(c, Some(cat)).unwrap();
-        let mine: Vec<common::ChannelOverride> = db.channel_overrides().unwrap().into_iter().filter(|o| o.channel_id == c).collect();
-        assert_eq!(
-            mine,
-            vec![common::ChannelOverride { channel_id: c, role: common::EVERYONE_ROLE, view: Some(false), send: None, manage_channels: None, manage_messages: None }],
-            "the channel's own setting is replaced by the category's"
-        );
-        db.move_channel(c, None).unwrap();
-        assert_eq!(everyone_view(&db, c), Some(Some(false)), "leaving the category keeps the copied setting");
-    }
-
-    #[test]
-    fn clearing_a_category_permission_clears_it_on_its_channels() {
-        let db = Db::open(":memory:").unwrap();
-        let a = db.ensure_channel("a").unwrap();
-        let cat = db.create_category("Group").unwrap().expect("made");
-        db.move_channel(a, Some(cat)).unwrap();
-        db.set_category_override(cat, common::EVERYONE_ROLE, common::Setting { view: Some(false), send: None, ..Default::default() }).unwrap();
-        db.set_category_override(cat, common::EVERYONE_ROLE, common::Setting { view: None, send: None, ..Default::default() }).unwrap();
-        assert!(db.category_overrides().unwrap().is_empty());
-        assert_eq!(everyone_view(&db, a), None);
-    }
-}
-
-#[cfg(test)]
-mod ordering_tests {
-    use super::*;
-
-    fn names(list: &[common::ChannelRef]) -> Vec<String> {
-        list.iter().map(|c| c.name.clone()).collect()
-    }
-
-    #[test]
-    fn a_channel_can_be_placed_before_another_or_at_the_end_of_a_category() {
-        let db = Db::open(":memory:").unwrap();
-        let a = db.ensure_channel("a").unwrap();
-        let b = db.ensure_channel("b").unwrap();
-        let c = db.ensure_channel("c").unwrap();
-        let cat = db.create_category("Group").unwrap().expect("made");
-        // Move c to the front of the uncategorized list, before a.
-        assert!(db.place_channel(c, None, Some(a)).unwrap());
-        assert_eq!(names(&db.uncategorized_channels().unwrap()), vec!["general", "random", "c", "a", "b"]);
-        // Put a into the category, at its end, then b before a.
-        assert!(db.place_channel(a, Some(cat), None).unwrap());
-        assert!(db.place_channel(b, Some(cat), Some(a)).unwrap());
-        let group = db.categories().unwrap().into_iter().find(|g| g.id == cat).unwrap();
-        assert_eq!(names(&group.channels), vec!["b", "a"]);
-        assert_eq!(names(&db.uncategorized_channels().unwrap()), vec!["general", "random", "c"]);
-    }
-
-    #[test]
-    fn a_category_can_be_renamed_but_not_to_a_taken_name() {
-        let db = Db::open(":memory:").unwrap();
-        let cat = db.create_category("Group").unwrap().expect("made");
-        db.create_category("Other").unwrap().expect("made");
-        assert!(!db.rename_category(cat, "Other").unwrap(), "the name is taken");
-        assert!(!db.rename_category(9999, "Missing").unwrap(), "there is no such category");
-        assert!(db.rename_category(cat, "Renamed").unwrap());
-        let names: Vec<String> = db.categories().unwrap().into_iter().map(|c| c.name).collect();
-        assert!(names.contains(&"Renamed".to_string()) && !names.contains(&"Group".to_string()));
-    }
-
-    #[test]
-    fn a_channel_moved_to_a_category_goes_to_its_end() {
-        let db = Db::open(":memory:").unwrap();
-        let x = db.ensure_channel("x").unwrap();
-        let y = db.ensure_channel("y").unwrap();
-        let cat = db.create_category("Group").unwrap().expect("made");
-        db.move_channel(x, Some(cat)).unwrap();
-        db.move_channel(y, Some(cat)).unwrap();
-        let group = db.categories().unwrap().into_iter().find(|g| g.id == cat).unwrap();
-        assert_eq!(names(&group.channels), vec!["x", "y"]);
-    }
-}
+#[path = "tests/db.rs"]
+mod tests;
