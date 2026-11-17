@@ -71,6 +71,16 @@ mod tests {
                 ..common::NameRule::default()
             },
             alert_channel: Some(3),
+            mentions: common::MentionRule {
+                enabled: true,
+                max_unique: 3,
+                raid_detection: true,
+                timeout_secs: 60,
+                block: false,
+                send_alert: false,
+                allowed_roles: vec![2],
+                notice: "Slow down with the mentions".into(),
+            },
         };
         db.set_automod(&rules).unwrap();
         assert_eq!(db.automod().unwrap(), rules);
