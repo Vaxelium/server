@@ -37,13 +37,16 @@ repository:
 
 ## Building
 
-Build it from the main repository, because this crate depends on `common` by relative path:
+This crate builds on its own. Clone it and run:
 
 ```
-git clone --recursive git@github.com:Vaxelium/Vaxelium.git
-cd Vaxelium
-cargo run -p server
+cargo test
 ```
+
+It fetches `common` from [its GitHub repository](https://github.com/Vaxelium/common).
+Inside the main repository, the workspace uses the local `common` folder instead, so
+changes to `common` are tested with the crates that use it.
+
 
 ## Licence
 
