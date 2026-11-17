@@ -13,8 +13,8 @@ Download `vaxelium-web-client.zip` from the
 `web/dist` inside this repository, or anywhere else and point `VAXELIUM_WEB_DIR` at it.
 The server then serves the page and says so when it starts.
 
-The web client is licensed under the PolyForm Noncommercial License 1.0.0 (see the zip's
-`index.html` link and the client's licence). Non-commercial use only.
+The web client is licensed under the PolyForm Noncommercial License 1.0.0. The zip includes
+the licence as `LICENSE.txt`. Non-commercial use only.
 
 ## Running
 
