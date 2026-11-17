@@ -38,6 +38,10 @@ struct State {
     dead_peers: HashMap<String, std::time::Instant>,
     /// The (member, name) pairs AutoMod has already posted an alert about, so each is reported once.
     name_alerts: std::collections::HashSet<(String, String)>,
+    /// Mentions each member's recent messages made, as (when, how many), for mention raid detection.
+    mention_log: HashMap<String, std::collections::VecDeque<(u64, usize)>>,
+    /// Members AutoMod has timed out from sending, and until when (Unix seconds).
+    timeouts: HashMap<String, u64>,
 }
 
 impl State {
@@ -248,6 +252,8 @@ async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         peer_failures: HashMap::new(),
         dead_peers: HashMap::new(),
         name_alerts: std::collections::HashSet::new(),
+        mention_log: HashMap::new(),
+        timeouts: HashMap::new(),
     }));
     {
         let s = state.lock().unwrap();
@@ -970,10 +976,15 @@ where
                             .await?;
                             continue;
                         }
-                        if let Some(reason) = automod_refusal(&state, &user, channel_id, &text, Some(&mut recent_sends))? {
-                            report_block(&state, &tx, &display, channel_id, &text, &reason)?;
-                            send(&mut writer, &ServerMsg::Error { text: reason }).await?;
-                            continue;
+                        if let Some(refusal) = automod_refusal(&state, &user, channel_id, &text, Some(&mut recent_sends))? {
+                            if refusal.alert {
+                                report_block(&state, &tx, &display, channel_id, &text, &refusal.reason)?;
+                            }
+                            if refusal.block {
+                                let shown = if refusal.notice.is_empty() { refusal.reason } else { refusal.notice };
+                                send(&mut writer, &ServerMsg::Error { text: shown }).await?;
+                                continue;
+                            }
                         }
                         let mut message = ChatMessage {
                             id: 0,
@@ -1289,10 +1300,15 @@ where
                             continue;
                         }
                         let edit_channel = state.lock().unwrap().db.message_channel_id(id)?.unwrap_or(0);
-                        if let Some(reason) = automod_refusal(&state, &user, edit_channel, &text, None)? {
-                            report_block(&state, &tx, &display, edit_channel, &text, &reason)?;
-                            send(&mut writer, &ServerMsg::Error { text: reason }).await?;
-                            continue;
+                        if let Some(refusal) = automod_refusal(&state, &user, edit_channel, &text, None)? {
+                            if refusal.alert {
+                                report_block(&state, &tx, &display, edit_channel, &text, &refusal.reason)?;
+                            }
+                            if refusal.block {
+                                let shown = if refusal.notice.is_empty() { refusal.reason } else { refusal.notice };
+                                send(&mut writer, &ServerMsg::Error { text: shown }).await?;
+                                continue;
+                            }
                         }
                         let edited = state.lock().unwrap().db.edit_message(id, &user, &text)?;
                         match edited {
@@ -2086,9 +2102,12 @@ fn name_flag(state: &SharedState, user: &str, display: &str) -> rusqlite::Result
 
 /// Why a member may not interact because of their name, or None when they may.
 fn name_block(state: &SharedState, user: &str, display: &str) -> rusqlite::Result<Option<String>> {
-    let blocking = state.lock().unwrap().db.automod()?.names.block_interactions;
-    if !blocking || name_flag(state, user, display)?.is_none() {
+    let rules = state.lock().unwrap().db.automod()?.names;
+    if !rules.block_interactions || name_flag(state, user, display)?.is_none() {
         return Ok(None);
+    }
+    if !rules.notice.is_empty() {
+        return Ok(Some(rules.notice));
     }
     Ok(Some(
         "AutoMod: your name is not allowed on this server. Change your display name to take part.".into(),
@@ -2176,13 +2195,34 @@ const NO_AUTOMOD_PERMISSION: &str = "you need the Manage Server permission to ch
 /// Why the server's automatic moderation refuses `text` from `user` in `channel`, or None when it may
 /// go. Members who may manage messages there are not checked, nor are direct messages. When
 /// `recent_sends` is given, this is a new message and the spam filter counts it.
+/// Why AutoMod caught a message, and what it does about it.
+struct Refusal {
+    reason: String,
+    /// What the member is shown, when it is not the reason. Empty means the reason.
+    notice: String,
+    /// Refuse the message. Off, it goes through and only the report and any timeout apply.
+    block: bool,
+    /// Post a report to AutoMod's channel.
+    alert: bool,
+}
+
+/// A refusal that blocks the message and is reported, as the word, link and spam rules are.
+fn blocked(reason: String) -> Refusal {
+    Refusal {
+        reason,
+        notice: String::new(),
+        block: true,
+        alert: true,
+    }
+}
+
 fn automod_refusal(
     state: &SharedState,
     user: &str,
     channel: i64,
     text: &str,
     recent_sends: Option<&mut std::collections::VecDeque<u64>>,
-) -> rusqlite::Result<Option<String>> {
+) -> rusqlite::Result<Option<Refusal>> {
     let (rules, in_dm) = {
         let s = state.lock().unwrap();
         let name = s.db.channel_name(channel)?.unwrap_or_default();
@@ -2191,11 +2231,24 @@ fn automod_refusal(
     if in_dm || may_in_channel(state, user, channel, perm::MANAGE_MESSAGES)? {
         return Ok(None);
     }
+    // A member AutoMod has timed out may not send until the time is up.
+    let now = now_secs();
+    let until = state.lock().unwrap().timeouts.get(user).copied();
+    if let Some(until) = until.filter(|&until| until > now) {
+        return Ok(Some(blocked(format!(
+            "AutoMod: you are timed out from sending messages for {} more seconds",
+            until - now
+        ))));
+    }
     if let Some(reason) = rules.check(text) {
-        return Ok(Some(reason));
+        return Ok(Some(blocked(reason)));
+    }
+    if rules.mentions.enabled {
+        if let Some(refusal) = mention_refusal(state, user, &rules.mentions, text, now)? {
+            return Ok(Some(refusal));
+        }
     }
     if let Some(sends) = recent_sends {
-        let now = now_secs();
         while sends
             .front()
             .is_some_and(|&t| now.saturating_sub(t) >= common::SPAM_WINDOW_SECS)
@@ -2203,11 +2256,79 @@ fn automod_refusal(
             sends.pop_front();
         }
         if rules.spam_filter && sends.len() >= common::SPAM_LIMIT {
-            return Ok(Some("AutoMod: you are sending messages too quickly, slow down".into()));
+            return Ok(Some(blocked(
+                "AutoMod: you are sending messages too quickly, slow down".into(),
+            )));
         }
         sends.push_back(now);
     }
     Ok(None)
+}
+
+/// What the mention rule does with `text`, or None when it does not apply. Counts the members and roles it
+/// mentions, keeps the count for raid detection, and times the member out when the rule says so.
+fn mention_refusal(
+    state: &SharedState,
+    user: &str,
+    rule: &common::MentionRule,
+    text: &str,
+    now: u64,
+) -> rusqlite::Result<Option<Refusal>> {
+    // Members who may manage the server, and members with an allowed role, are left alone.
+    if may(state, user, perm::MANAGE_SERVER)? {
+        return Ok(None);
+    }
+    let held = state.lock().unwrap().db.member_role_ids(user)?;
+    if held.iter().any(|r| rule.allowed_roles.contains(r)) {
+        return Ok(None);
+    }
+    let (members, roles) = {
+        let s = state.lock().unwrap();
+        let members: Vec<String> = s.db.display_names()?.into_values().collect();
+        let roles: Vec<String> =
+            s.db.role_list()?
+                .into_iter()
+                .filter(|r| r.mentionable && r.id != common::EVERYONE_ROLE)
+                .map(|r| r.name)
+                .collect();
+        (members, roles)
+    };
+    let count = common::mentioned_count(text, &members, &roles);
+    if count == 0 {
+        return Ok(None);
+    }
+    let mut s = state.lock().unwrap();
+    let log = s.mention_log.entry(user.to_string()).or_default();
+    while log
+        .front()
+        .is_some_and(|&(at, _)| now.saturating_sub(at) >= common::RAID_WINDOW_SECS)
+    {
+        log.pop_front();
+    }
+    let recent: usize = log.iter().map(|&(_, n)| n).sum();
+    log.push_back((now, count));
+    let max = rule.max_unique as usize;
+    let reason = if count > max {
+        Some(format!(
+            "AutoMod: your message mentions {count} people or roles, more than the {max} allowed"
+        ))
+    } else if rule.raid_detection && recent + count >= common::RAID_MENTIONS {
+        Some("AutoMod: mention raid detected, too many people were mentioned in a short time".to_string())
+    } else {
+        None
+    };
+    let Some(reason) = reason else {
+        return Ok(None);
+    };
+    if rule.timeout_secs > 0 {
+        s.timeouts.insert(user.to_string(), now + rule.timeout_secs);
+    }
+    Ok(Some(Refusal {
+        reason,
+        notice: rule.notice.clone(),
+        block: rule.block,
+        alert: rule.send_alert,
+    }))
 }
 
 /// Says the channel cannot be used by this member, for the message that refuses them.
