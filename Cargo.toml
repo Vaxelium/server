@@ -1,10 +1,10 @@
 [package]
 name = "server"
-version.workspace = true
-edition.workspace = true
+version = "0.1.0"
+edition = "2021"
 
 [dependencies]
-common = { path = "../common" }
+common = { git = "https://github.com/Vaxelium/common", branch = "main" }
 anyhow = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
