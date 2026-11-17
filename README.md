@@ -4,8 +4,17 @@ The chat server. It holds channels, messages, roles, pins, presence and direct m
 SQLite, and checks every login with the auth service.
 
 It also serves the web client on its own port, so people can use Vaxelium in a browser. The
-web client is the desktop client compiled to WebAssembly. Build it with the main repository's
-`scripts/build-web.sh`.
+web client is the desktop client compiled to WebAssembly.
+
+### Getting the web client
+
+Download `vaxelium-web-client.zip` from the
+[web client releases](https://github.com/Vaxelium/server/releases) and unzip it into
+`web/dist` inside this repository, or anywhere else and point `VAXELIUM_WEB_DIR` at it.
+The server then serves the page and says so when it starts.
+
+The web client is licensed under the PolyForm Noncommercial License 1.0.0 (see the zip's
+`index.html` link and the client's licence). Non-commercial use only.
 
 ## Running
 
