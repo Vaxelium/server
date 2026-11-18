@@ -2606,6 +2606,8 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
             if db.role_name_taken(&name, role)? {
                 return Ok(Err("a role with that name already exists".into()));
             }
+            // The AutoMod role is always an administrator, so the bot is not held to channel permissions.
+            let permissions = if role == common::AUTOMOD_ROLE { perm::ADMINISTRATOR } else { permissions };
             db.update_role(role, &name, &color, permissions, mentionable, hoisted)?;
             Ok(Ok(()))
         }

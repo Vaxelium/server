@@ -244,7 +244,10 @@ impl Db {
             [],
         )?;
         // The AutoMod role, if it was made, sits below @everyone. Set on every start, for servers made earlier.
-        conn.execute("UPDATE roles SET position = -2000000000 WHERE id = -1", [])?;
+        conn.execute(
+            "UPDATE roles SET position = -2000000000, permissions = ?1 WHERE id = -1",
+            params![common::perm::ADMINISTRATOR as i64],
+        )?;
         // Give @everyone View channels and Message channels once, for servers made before they existed.
         // The flag keeps a later change by the owner from being undone at the next start.
         if conn.execute(
@@ -574,12 +577,12 @@ impl Db {
     pub fn ensure_automod_role(&self) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO roles (id, name, color, permissions, position, mentionable, hoisted)
-             VALUES (?1, 'AutoMod', '', 0, -2000000000, 0, 0)",
-            params![common::AUTOMOD_ROLE],
+             VALUES (?1, 'AutoMod', '', ?2, -2000000000, 0, 0)",
+            params![common::AUTOMOD_ROLE, common::perm::ADMINISTRATOR as i64],
         )?;
         self.conn.execute(
-            "UPDATE roles SET position = -2000000000 WHERE id = ?1",
-            params![common::AUTOMOD_ROLE],
+            "UPDATE roles SET position = -2000000000, permissions = ?2 WHERE id = ?1",
+            params![common::AUTOMOD_ROLE, common::perm::ADMINISTRATOR as i64],
         )?;
         Ok(())
     }
