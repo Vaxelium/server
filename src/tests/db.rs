@@ -15,7 +15,30 @@ mod tests {
             reactions: vec![],
             reply: None,
             pinned: false,
+            report: None,
         }
+    }
+
+    #[test]
+    fn automod_reports_are_kept_with_the_message() {
+        let db = Db::open(":memory:").unwrap();
+        let general = db.ensure_channel("general").unwrap();
+        let mut alert = message(&db, "general", common::AUTOMOD_ID, "Blocked a message");
+        alert.author = "AutoMod".into();
+        alert.report = Some(common::AutoModReport {
+            user_id: "id-dummy".into(),
+            display: "Dummy".into(),
+            channel_id: general,
+            channel: "general".into(),
+            rule: "AutoMod Flagged Words".into(),
+            keyword: "twat".into(),
+            content: "your a twat mate".into(),
+        });
+        db.save_message(&alert).unwrap();
+        db.save_message(&message(&db, "general", "bob", "hello")).unwrap();
+        let history = db.history(general).unwrap();
+        assert_eq!(history[0].report, alert.report, "the report comes back with the alert");
+        assert!(history[1].report.is_none(), "ordinary messages have none");
     }
 
     #[test]
@@ -226,6 +249,7 @@ mod rename_tests {
             reactions: Vec::new(),
             reply: None,
             pinned: false,
+            report: None,
         };
         db.save_message(&m).unwrap();
 
@@ -258,6 +282,7 @@ mod rename_tests {
             reactions: Vec::new(),
             reply: None,
             pinned: false,
+            report: None,
         };
         db.save_message(&m).unwrap();
         assert!(db.delete_channel(general).unwrap());
@@ -389,6 +414,7 @@ mod member_id_tests {
             reactions: Vec::new(),
             reply: None,
             pinned: false,
+            report: None,
         })
         .unwrap();
         assert!(db.legacy_ids().unwrap().contains(&"alice".to_string()));

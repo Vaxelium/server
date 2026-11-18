@@ -278,6 +278,7 @@ impl Db {
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN reply_to INTEGER", []);
         // Messages made before pins lack this column; they are not pinned. Set to when it was pinned.
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN pinned_at INTEGER", []);
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN report TEXT", []);
         // Channels made before they could be ordered lack this column; they keep their name order.
         let _ = conn.execute(
             "ALTER TABLE channels ADD COLUMN position INTEGER NOT NULL DEFAULT 0",
@@ -1447,8 +1448,8 @@ impl Db {
 
     pub fn save_message(&self, m: &ChatMessage) -> rusqlite::Result<i64> {
         self.conn.execute(
-            "INSERT INTO messages (channel, channel_id, author, text, timestamp, reply_to)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO messages (channel, channel_id, author, text, timestamp, reply_to, report)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             // Messages are stored under the author's id, so they stay with the account.
             params![
                 m.channel,
@@ -1456,7 +1457,8 @@ impl Db {
                 m.author_id,
                 m.text,
                 m.timestamp as i64,
-                m.reply.as_ref().map(|r| r.id)
+                m.reply.as_ref().map(|r| r.id),
+                m.report.as_ref().and_then(|r| serde_json::to_string(r).ok())
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -1601,7 +1603,7 @@ impl Db {
     /// The most recent `HISTORY_LEN` messages in a channel, oldest first.
     pub fn history(&self, channel: i64) -> rusqlite::Result<Vec<ChatMessage>> {
         self.load_messages(
-            "SELECT id, channel_id, author, text, timestamp, edited, reply_to, pinned_at
+            "SELECT id, channel_id, author, text, timestamp, edited, reply_to, pinned_at, report
              FROM messages WHERE channel_id = ?1 ORDER BY id DESC LIMIT ?2",
             "m.id ASC",
             params![channel, HISTORY_LEN],
@@ -1611,7 +1613,7 @@ impl Db {
     /// A channel's pinned messages, the most recently pinned first.
     pub fn pins(&self, channel: i64) -> rusqlite::Result<Vec<ChatMessage>> {
         self.load_messages(
-            "SELECT id, channel_id, author, text, timestamp, edited, reply_to, pinned_at
+            "SELECT id, channel_id, author, text, timestamp, edited, reply_to, pinned_at, report
              FROM messages WHERE channel_id = ?1 AND pinned_at IS NOT NULL
              ORDER BY pinned_at DESC, id DESC LIMIT ?2",
             "m.pinned_at DESC, m.id DESC",
@@ -1656,7 +1658,7 @@ impl Db {
     fn load_messages(&self, sql: &str, order: &str, args: impl rusqlite::Params) -> rusqlite::Result<Vec<ChatMessage>> {
         let sql = format!(
             "SELECT m.id, m.channel_id, m.author, m.text, m.timestamp, m.edited, m.reply_to, r.author, r.text,
-                    m.pinned_at IS NOT NULL
+                    m.pinned_at IS NOT NULL, m.report
              FROM ({sql}) AS m
              LEFT JOIN messages AS r ON r.id = m.reply_to
              ORDER BY {order}"
@@ -1687,6 +1689,9 @@ impl Db {
                 reactions: Vec::new(),
                 reply: reply.transpose()?,
                 pinned: row.get(9)?,
+                report: row
+                    .get::<_, Option<String>>(10)?
+                    .and_then(|json| serde_json::from_str(&json).ok()),
             })
         })?;
         let mut messages: Vec<ChatMessage> = rows.collect::<rusqlite::Result<_>>()?;
