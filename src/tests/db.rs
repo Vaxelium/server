@@ -121,6 +121,17 @@ mod tests {
                 allowed_roles: vec![4],
                 allowed_channels: vec![5],
             },
+            filtered: common::FilteredWords {
+                enabled: true,
+                patterns: vec!["bad[0-9]+".into()],
+                repeated_chars: true,
+                repeated_limit: 4,
+                block: false,
+                send_alert: true,
+                notice: "No filters here".into(),
+                allowed_roles: vec![6],
+                allowed_channels: vec![7],
+            },
         };
         db.set_automod(&rules).unwrap();
         assert_eq!(db.automod().unwrap(), rules);
