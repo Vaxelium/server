@@ -2097,11 +2097,14 @@ fn visible_layout(
     categories: Vec<common::CategoryInfo>,
     uncategorized: Vec<common::ChannelRef>,
 ) -> (Vec<common::CategoryInfo>, Vec<common::ChannelRef>) {
+    // A category whose channels are all hidden from this member is left out, as it would show an empty heading.
+    // A category that was empty to begin with is kept.
     let categories = categories
         .into_iter()
-        .map(|mut c| {
+        .filter_map(|mut c| {
+            let had_channels = !c.channels.is_empty();
             c.channels.retain(|ch| access.allows(ch.id, perm::VIEW_CHANNEL));
-            c
+            (!had_channels || !c.channels.is_empty()).then_some(c)
         })
         .collect();
     let uncategorized = uncategorized
