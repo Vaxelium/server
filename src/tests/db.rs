@@ -81,6 +81,23 @@ mod tests {
                 allowed_roles: vec![2],
                 notice: "Slow down with the mentions".into(),
             },
+            flagged: common::FlaggedWords {
+                enabled: true,
+                severe_profanity: true,
+                general_insults: false,
+                identity_slurs: true,
+                mild_profanity: true,
+                sexual_content: true,
+                sexual_harassment: true,
+                threats: true,
+                spam: false,
+                allow: vec!["porn star".into()],
+                block: true,
+                send_alert: false,
+                notice: "Watch your language".into(),
+                allowed_roles: vec![4],
+                allowed_channels: vec![5],
+            },
         };
         db.set_automod(&rules).unwrap();
         assert_eq!(db.automod().unwrap(), rules);

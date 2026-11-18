@@ -2243,6 +2243,21 @@ fn automod_refusal(
     if let Some(reason) = rules.check(text) {
         return Ok(Some(blocked(reason)));
     }
+    if let Some(flag) = rules.flagged.flags(text) {
+        if flagged_applies(state, user, channel, &rules.flagged)? {
+            return Ok(Some(Refusal {
+                reason: format!(
+                    "AutoMod: your message contains a flagged word ({}, {} severity: {})",
+                    flag.word,
+                    flag.category.name(),
+                    format!("{:?}", flag.severity).to_lowercase()
+                ),
+                notice: rules.flagged.notice.clone(),
+                block: rules.flagged.block,
+                alert: rules.flagged.send_alert,
+            }));
+        }
+    }
     if rules.mentions.enabled {
         if let Some(refusal) = mention_refusal(state, user, &rules.mentions, text, now)? {
             return Ok(Some(refusal));
@@ -2263,6 +2278,21 @@ fn automod_refusal(
         sends.push_back(now);
     }
     Ok(None)
+}
+
+/// Whether the flagged words rule applies to `user` in `channel`. Members with Manage Server, holders of an
+/// allowed role, and anyone in an allowed channel are left alone.
+fn flagged_applies(
+    state: &SharedState,
+    user: &str,
+    channel: i64,
+    rule: &common::FlaggedWords,
+) -> rusqlite::Result<bool> {
+    if rule.allowed_channels.contains(&channel) || may(state, user, perm::MANAGE_SERVER)? {
+        return Ok(false);
+    }
+    let held = state.lock().unwrap().db.member_role_ids(user)?;
+    Ok(!held.iter().any(|r| rule.allowed_roles.contains(r)))
 }
 
 /// What the mention rule does with `text`, or None when it does not apply. Counts the members and roles it
