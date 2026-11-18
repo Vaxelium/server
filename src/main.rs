@@ -944,9 +944,9 @@ where
                         // tries to send a message.
                         if let Some(word) = name_flag(&state, &user, &display)? {
                             if let Some(reason) = name_block(&state, &user, &display)? {
-                                let why = format!("their name matches `{word}`");
+                                let why = format!("their name matches “{word}”");
                                 // The name was the problem, not the message, so the message is left out.
-                                report_block(&state, &tx, &display, channel_id, "", &why)?;
+                                report_block(&state, &tx, &user, &display, channel_id, "", &why, "Flagged Member Names", &word)?;
                                 send(&mut writer, &ServerMsg::Error { text: reason }).await?;
                                 continue;
                             }
@@ -978,7 +978,17 @@ where
                         }
                         if let Some(refusal) = automod_refusal(&state, &user, channel_id, &text, Some(&mut recent_sends))? {
                             if refusal.alert {
-                                report_block(&state, &tx, &display, channel_id, &text, &refusal.reason)?;
+                                report_block(
+                                    &state,
+                                    &tx,
+                                    &user,
+                                    &display,
+                                    channel_id,
+                                    &text,
+                                    &refusal.reason,
+                                    refusal.rule,
+                                    &refusal.keyword,
+                                )?;
                             }
                             if refusal.block {
                                 let shown = if refusal.notice.is_empty() { refusal.reason } else { refusal.notice };
@@ -998,6 +1008,7 @@ where
                             reactions: Vec::new(),
                             reply: None,
                             pinned: false,
+                            report: None,
                         };
                         // A reply must answer a message in the same channel; anything else is sent plain.
                         if let Some(id) = reply_to {
@@ -1276,7 +1287,17 @@ where
                         if let Some(reason) = name_block(&state, &user, &display)? {
                             let channel = state.lock().unwrap().db.message_channel_id(id)?.unwrap_or(0);
                             let word = name_flag(&state, &user, &display)?.unwrap_or_default();
-                            report_block(&state, &tx, &display, channel, "", &format!("their name matches `{word}`"))?;
+                            report_block(
+                                &state,
+                                &tx,
+                                &user,
+                                &display,
+                                channel,
+                                "",
+                                &format!("their name matches “{word}”"),
+                                "Flagged Member Names",
+                                &word,
+                            )?;
                             send(&mut writer, &ServerMsg::Error { text: reason }).await?;
                             continue;
                         }
@@ -1302,7 +1323,17 @@ where
                         let edit_channel = state.lock().unwrap().db.message_channel_id(id)?.unwrap_or(0);
                         if let Some(refusal) = automod_refusal(&state, &user, edit_channel, &text, None)? {
                             if refusal.alert {
-                                report_block(&state, &tx, &display, edit_channel, &text, &refusal.reason)?;
+                                report_block(
+                                    &state,
+                                    &tx,
+                                    &user,
+                                    &display,
+                                    edit_channel,
+                                    &text,
+                                    &refusal.reason,
+                                    refusal.rule,
+                                    &refusal.keyword,
+                                )?;
                             }
                             if refusal.block {
                                 let shown = if refusal.notice.is_empty() { refusal.reason } else { refusal.notice };
@@ -1641,6 +1672,7 @@ async fn relay_receive(
             reactions: Vec::new(),
             reply: None,
             pinned: false,
+            report: None,
         };
         message.id = s.db.save_message(&message).map_err(|e| e.to_string())?;
         message
@@ -2129,31 +2161,63 @@ fn name_alert(
             return Ok(());
         }
     }
+    let details = common::AutoModReport {
+        user_id: user.to_string(),
+        display: display.to_string(),
+        channel_id: 0,
+        channel: String::new(),
+        rule: "Flagged Member Names".to_string(),
+        keyword: word.to_string(),
+        content: String::new(),
+    };
     automod_post(
         state,
         tx,
-        &format!("Flagged the name of **{display}** (matched `{word}`)."),
+        &format!("Flagged the name of **{display}**: it matches “{word}”."),
+        Some(details),
     )
 }
 
-/// Reports to AutoMod's channel that it blocked `display` in `channel`: why, and what they tried to send.
+/// Reports to AutoMod's channel that it blocked `display` (`user`) in `channel`: the rule that caught it, the word
+/// it matched, and what they tried to send. `reason` is the sentence for the report's text.
+#[allow(clippy::too_many_arguments)]
 fn report_block(
     state: &SharedState,
     tx: &tokio::sync::broadcast::Sender<ServerMsg>,
+    user: &str,
     display: &str,
     channel: i64,
     text: &str,
     reason: &str,
+    rule: &str,
+    keyword: &str,
 ) -> rusqlite::Result<()> {
     let place = state.lock().unwrap().db.channel_name(channel)?.unwrap_or_default();
+    // The reason as a sentence: "Your message uses ...", ending in a full stop.
     let why = reason.strip_prefix("AutoMod: ").unwrap_or(reason);
-    let mut report = format!("Blocked a message from **{display}** in #{place}: {why}.");
+    let mut sentence = why.to_string();
+    if let Some(first) = sentence.get(..1).map(str::to_uppercase) {
+        sentence.replace_range(..1, &first);
+    }
+    if !sentence.ends_with(['.', '!', '?']) {
+        sentence.push('.');
+    }
+    let mut report = format!("Blocked a message from **{display}** in #{place}\nReason: {sentence}");
     let quoted: Vec<String> = text.trim().lines().map(|l| format!("> {l}")).collect();
     if !quoted.is_empty() {
         report.push_str("\n\n");
         report.push_str(&quoted.join("\n"));
     }
-    automod_post(state, tx, &report)
+    let details = common::AutoModReport {
+        user_id: user.to_string(),
+        display: display.to_string(),
+        channel_id: channel,
+        channel: place,
+        rule: rule.to_string(),
+        keyword: keyword.to_string(),
+        content: text.trim().to_string(),
+    };
+    automod_post(state, tx, &report, Some(details))
 }
 
 /// Posts a message from AutoMod to its channel, when it has one.
@@ -2161,6 +2225,7 @@ fn automod_post(
     state: &SharedState,
     tx: &tokio::sync::broadcast::Sender<ServerMsg>,
     text: &str,
+    report: Option<common::AutoModReport>,
 ) -> rusqlite::Result<()> {
     let message = {
         let s = state.lock().unwrap();
@@ -2182,6 +2247,7 @@ fn automod_post(
             reactions: Vec::new(),
             reply: None,
             pinned: false,
+            report,
         };
         message.id = s.db.save_message(&message)?;
         message
@@ -2204,15 +2270,20 @@ struct Refusal {
     block: bool,
     /// Post a report to AutoMod's channel.
     alert: bool,
+    /// The rule that caught the message, as its report names it, and the word it matched (empty if none).
+    rule: &'static str,
+    keyword: String,
 }
 
 /// A refusal that blocks the message and is reported, as the word, link and spam rules are.
-fn blocked(reason: String) -> Refusal {
+fn blocked(reason: String, rule: &'static str, keyword: String) -> Refusal {
     Refusal {
         reason,
         notice: String::new(),
         block: true,
         alert: true,
+        rule,
+        keyword,
     }
 }
 
@@ -2235,19 +2306,20 @@ fn automod_refusal(
     let now = now_secs();
     let until = state.lock().unwrap().timeouts.get(user).copied();
     if let Some(until) = until.filter(|&until| until > now) {
-        return Ok(Some(blocked(format!(
-            "AutoMod: you are timed out from sending messages for {} more seconds",
-            until - now
-        ))));
+        return Ok(Some(blocked(
+            format!("AutoMod: you are timed out for {} more seconds", until - now),
+            "Timeout",
+            String::new(),
+        )));
     }
-    if let Some(reason) = rules.check(text) {
-        return Ok(Some(blocked(reason)));
+    if let Some(breach) = rules.check(text) {
+        return Ok(Some(blocked(breach.reason, breach.rule, breach.keyword)));
     }
     if let Some(flag) = rules.flagged.flags(text) {
         if flagged_applies(state, user, channel, &rules.flagged)? {
             return Ok(Some(Refusal {
                 reason: format!(
-                    "AutoMod: your message contains a flagged word ({}, {} severity: {})",
+                    "AutoMod: your message uses a flagged word: “{}” ({}, {} severity)",
                     flag.word,
                     flag.category.name(),
                     format!("{:?}", flag.severity).to_lowercase()
@@ -2255,6 +2327,8 @@ fn automod_refusal(
                 notice: rules.flagged.notice.clone(),
                 block: rules.flagged.block,
                 alert: rules.flagged.send_alert,
+                rule: "AutoMod Flagged Words",
+                keyword: flag.word.clone(),
             }));
         }
     }
@@ -2272,7 +2346,9 @@ fn automod_refusal(
         }
         if rules.spam_filter && sends.len() >= common::SPAM_LIMIT {
             return Ok(Some(blocked(
-                "AutoMod: you are sending messages too quickly, slow down".into(),
+                "AutoMod: you are sending messages too quickly".into(),
+                "Spam Filter",
+                String::new(),
             )));
         }
         sends.push_back(now);
@@ -2340,10 +2416,10 @@ fn mention_refusal(
     let max = rule.max_unique as usize;
     let reason = if count > max {
         Some(format!(
-            "AutoMod: your message mentions {count} people or roles, more than the {max} allowed"
+            "AutoMod: your message mentions {count} people or roles, but the limit is {max}"
         ))
     } else if rule.raid_detection && recent + count >= common::RAID_MENTIONS {
-        Some("AutoMod: mention raid detected, too many people were mentioned in a short time".to_string())
+        Some("AutoMod: too many people were mentioned in a short time".to_string())
     } else {
         None
     };
@@ -2358,6 +2434,8 @@ fn mention_refusal(
         notice: rule.notice.clone(),
         block: rule.block,
         alert: rule.send_alert,
+        rule: "Mention Limit",
+        keyword: String::new(),
     }))
 }
 
