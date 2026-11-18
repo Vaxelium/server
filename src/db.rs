@@ -243,6 +243,8 @@ impl Db {
             "INSERT OR IGNORE INTO roles (id, name, color, permissions, position) VALUES (0, '@everyone', '', 0, -1000000000)",
             [],
         )?;
+        // The AutoMod role, if it was made, sits below @everyone. Set on every start, for servers made earlier.
+        conn.execute("UPDATE roles SET position = -2000000000 WHERE id = -1", [])?;
         // Give @everyone View channels and Message channels once, for servers made before they existed.
         // The flag keeps a later change by the owner from being undone at the next start.
         if conn.execute(
@@ -565,6 +567,21 @@ impl Db {
             [],
             |row| row.get(0),
         )
+    }
+
+    /// Makes the AutoMod role if it is not there yet, and keeps it last: below @everyone, which sits at the
+    /// bottom of the real roles. Its colour is the colour of AutoMod's messages.
+    pub fn ensure_automod_role(&self) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO roles (id, name, color, permissions, position, mentionable, hoisted)
+             VALUES (?1, 'AutoMod', '', 0, -2000000000, 0, 0)",
+            params![common::AUTOMOD_ROLE],
+        )?;
+        self.conn.execute(
+            "UPDATE roles SET position = -2000000000 WHERE id = ?1",
+            params![common::AUTOMOD_ROLE],
+        )?;
+        Ok(())
     }
 
     /// The server's automatic moderation rules. A server that never set any has none switched on.
@@ -1284,9 +1301,9 @@ impl Db {
         mentionable: bool,
         hoisted: bool,
     ) -> rusqlite::Result<Option<i64>> {
-        // Above @everyone, which sits at the very bottom.
+        // Above @everyone, which sits at the very bottom, and above the AutoMod role, which sits below it.
         let position: i64 = self.conn.query_row(
-            "SELECT COALESCE(MIN(position), 1) - 1 FROM roles WHERE id != 0",
+            "SELECT COALESCE(MIN(position), 1) - 1 FROM roles WHERE id NOT IN (0, -1)",
             [],
             |row| row.get(0),
         )?;
