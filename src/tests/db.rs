@@ -20,6 +20,14 @@ mod tests {
     }
 
     #[test]
+    fn the_automod_role_is_always_an_administrator() {
+        let db = Db::open(":memory:").unwrap();
+        db.ensure_automod_role().unwrap();
+        let role = db.role_list().unwrap().into_iter().find(|r| r.id == common::AUTOMOD_ROLE).unwrap();
+        assert_eq!(role.permissions & common::perm::ADMINISTRATOR, common::perm::ADMINISTRATOR);
+    }
+
+    #[test]
     fn the_automod_role_is_listed_last_below_everyone() {
         let db = Db::open(":memory:").unwrap();
         db.ensure_automod_role().unwrap();
