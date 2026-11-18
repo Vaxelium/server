@@ -1226,7 +1226,15 @@ where
                             continue;
                         }
                         let rules = rules.tidied();
-                        state.lock().unwrap().db.set_automod(&rules)?;
+                        {
+                            let s = state.lock().unwrap();
+                            s.db.set_automod(&rules)?;
+                            // The AutoMod role is made once a rule is on, so the bot's messages have a colour.
+                            if rules.any_rule_on() {
+                                s.db.ensure_automod_role()?;
+                                let _ = tx.send(ServerMsg::Roles { roles: s.db.role_list()? });
+                            }
+                        }
                         send(&mut writer, &ServerMsg::AutoMod { rules }).await?;
                     }
                     ClientMsg::Pin { id, pinned } => {
@@ -2602,6 +2610,9 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
             if role == EVERYONE_ROLE {
                 return Ok(Err("@everyone cannot be deleted".into()));
             }
+            if role == common::AUTOMOD_ROLE {
+                return Ok(Err("the AutoMod role belongs to the bot and cannot be deleted".into()));
+            }
             let Some(index) = index_of(role) else {
                 return Ok(Err(no_role.into()));
             };
@@ -2615,14 +2626,21 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
             if role == EVERYONE_ROLE {
                 return Ok(Err("@everyone stays at the bottom".into()));
             }
+            if role == common::AUTOMOD_ROLE {
+                return Ok(Err("the AutoMod role stays where it is".into()));
+            }
             let Some(index) = index_of(role) else {
                 return Ok(Err(no_role.into()));
             };
             if !power.outranks(index) {
                 return Ok(Err(below_you.into()));
             }
-            // Only the real roles are reordered; @everyone stays at the bottom.
-            let mut ids: Vec<i64> = order.iter().map(|r| r.id).filter(|&id| id != EVERYONE_ROLE).collect();
+            // Only the real roles are reordered; @everyone and the AutoMod role keep their places.
+            let mut ids: Vec<i64> = order
+                .iter()
+                .map(|r| r.id)
+                .filter(|&id| id != EVERYONE_ROLE && id != common::AUTOMOD_ROLE)
+                .collect();
             ids.retain(|&id| id != role);
             let at = match before {
                 Some(b) => match ids.iter().position(|&id| id == b) {
@@ -2647,6 +2665,9 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
         RoleChange::Member { user, role, on } => {
             if role == EVERYONE_ROLE {
                 return Ok(Err("@everyone is given to everyone automatically".into()));
+            }
+            if role == common::AUTOMOD_ROLE {
+                return Ok(Err("the AutoMod role belongs to the bot and cannot be given to members".into()));
             }
             let Some(index) = index_of(role) else {
                 return Ok(Err(no_role.into()));

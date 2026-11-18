@@ -20,6 +20,30 @@ mod tests {
     }
 
     #[test]
+    fn the_automod_role_is_listed_last_below_everyone() {
+        let db = Db::open(":memory:").unwrap();
+        db.ensure_automod_role().unwrap();
+        db.create_role("Founder", "#1abc9c", 0, false, false).unwrap();
+        let roles = db.role_list().unwrap();
+        let ids: Vec<i64> = roles.iter().map(|r| r.id).collect();
+        assert_eq!(ids.last(), Some(&common::AUTOMOD_ROLE), "AutoMod is the last role: {ids:?}");
+        assert_eq!(ids[ids.len() - 2], common::EVERYONE_ROLE, "@everyone is just above it");
+    }
+
+    #[test]
+    fn the_automod_role_is_made_once_and_never_clashes_with_new_roles() {
+        let db = Db::open(":memory:").unwrap();
+        db.ensure_automod_role().unwrap();
+        db.ensure_automod_role().unwrap();
+        let roles = db.role_list().unwrap();
+        let automod: Vec<_> = roles.iter().filter(|r| r.id == common::AUTOMOD_ROLE).collect();
+        assert_eq!(automod.len(), 1, "made once");
+        assert_eq!(automod[0].name, "AutoMod");
+        let made = db.create_role("Mods", "", 0, false, false).unwrap().expect("made");
+        assert!(made > 0, "a new role gets a positive id, not the AutoMod id");
+    }
+
+    #[test]
     fn automod_reports_are_kept_with_the_message() {
         let db = Db::open(":memory:").unwrap();
         let general = db.ensure_channel("general").unwrap();
