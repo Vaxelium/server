@@ -1687,6 +1687,37 @@ async fn auth_call(state: &SharedState, auth_addr: &str, request: &AuthRequest) 
     serde_json::from_str(&reply).map_err(|e| format!("bad reply from auth service: {e}"))
 }
 
+/// The direct message service: `VAXELIUM_DM`, or its default address.
+fn dm_addr() -> String {
+    std::env::var("VAXELIUM_DM").unwrap_or_else(|_| common::DEFAULT_DM_ADDR.to_string())
+}
+
+/// Passes a direct message request on to the direct message service and returns its reply. Its
+/// certificate is checked against the one remembered, as the auth service's is. Used for the web
+/// client, which cannot reach the service itself.
+async fn dm_call(state: &SharedState, request: &common::DmRequest) -> Result<common::DmReply, String> {
+    let addr = dm_addr();
+    let (mut stream, fingerprint) = common::tls::connect_async(&addr)
+        .await
+        .map_err(|e| format!("direct message service unavailable: {e}"))?;
+    if !pin_ok(state, "dm", &addr, &fingerprint) {
+        return Err("the direct message service's certificate has changed".into());
+    }
+    let mut line = serde_json::to_string(request).map_err(|e| e.to_string())?;
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| format!("direct message service unavailable: {e}"))?;
+    let mut lines = BufReader::new(stream).lines();
+    let reply = lines
+        .next_line()
+        .await
+        .map_err(|e| format!("direct message service unavailable: {e}"))?
+        .ok_or_else(|| "direct message service closed the connection".to_string())?;
+    serde_json::from_str(&reply).map_err(|e| format!("bad reply from direct message service: {e}"))
+}
+
 async fn check_session(state: &SharedState, auth_addr: &str, token: &str) -> Result<Identity, String> {
     match verify_session(state, auth_addr, token).await {
         Ok(identity) => {
