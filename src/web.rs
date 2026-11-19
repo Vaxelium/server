@@ -7,10 +7,14 @@
 //! auth service either, so a message of the form `{"auth": AuthRequest}` is passed on to it and its
 //! answer comes back as `{"auth": AuthReply}`, or `{"auth_unavailable": why}` when it cannot be
 //! reached. The requests only chat servers make are refused.
+//!
+//! Direct messages work the same way: `{"dm": DmRequest}` is passed to the direct message service (at
+//! `VAXELIUM_DM`, or its default address) and its answer comes back as `{"dm": DmReply}`, or
+//! `{"dm_unavailable": why}`.
 
 use std::sync::Arc;
 
-use common::{AuthReply, AuthRequest, ServerMsg};
+use common::{AuthReply, AuthRequest, DmRequest, ServerMsg};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -222,6 +226,15 @@ async fn bridge(
         if text.len() > MAX_LINE {
             continue;
         }
+        if let Some(request) = dm_request(&text) {
+            let line = match crate::dm_call(&state, &request).await {
+                Ok(reply) => serde_json::json!({ "dm": reply }),
+                Err(e) => serde_json::json!({ "dm_unavailable": e }),
+            }
+            .to_string();
+            let _ = out_tx.send(Some(line));
+            continue;
+        }
         if let Some(request) = auth_request(&text) {
             let line = match request {
                 Some(request) => match crate::auth_call(&state, &auth_addr, &request).await {
@@ -263,6 +276,12 @@ fn auth_request(text: &str) -> Option<Option<AuthRequest>> {
         | AuthRequest::Migrations { .. } => None,
         _ => Some(request),
     })
+}
+
+/// A direct message request in a page's line, when it is one.
+fn dm_request(text: &str) -> Option<DmRequest> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    serde_json::from_value(value.get("dm")?.clone()).ok()
 }
 
 #[cfg(test)]

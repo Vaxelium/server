@@ -16,6 +16,14 @@ fn server_only_requests_are_refused() {
 }
 
 #[test]
+fn direct_message_requests_are_passed_on() {
+    let open = r#"{"dm":{"type":"open","token":"t","with":"id-bob"}}"#;
+    assert!(matches!(dm_request(open), Some(common::DmRequest::Open { .. })));
+    assert!(dm_request(r#"{"type":"say","text":"hi"}"#).is_none());
+    assert!(dm_request(r#"{"dm":{"type":"nonsense"}}"#).is_none());
+}
+
+#[test]
 fn files_stay_inside_the_folder() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
