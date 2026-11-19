@@ -1,5 +1,5 @@
 //! The web client. A second port serves the desktop client compiled for the browser (from the folder
-//! `scripts/build-web.sh` writes) over HTTP, and lets it talk to this server over a WebSocket, as a
+//! `cargo xtask web` writes) over HTTP, and lets it talk to this server over a WebSocket, as a
 //! browser cannot open the TLS sockets the desktop client uses.
 //!
 //! Each WebSocket carries the same JSON lines as the desktop protocol and is joined to the normal
