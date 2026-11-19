@@ -12,6 +12,12 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS left_members (
     name TEXT PRIMARY KEY
 );
+CREATE TABLE IF NOT EXISTS bans (
+    user_id TEXT PRIMARY KEY,
+    reason TEXT NOT NULL DEFAULT '',
+    by_id TEXT NOT NULL DEFAULT '',
+    at INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS members (
     name       TEXT PRIMARY KEY,
     first_seen INTEGER NOT NULL
@@ -592,6 +598,69 @@ impl Db {
             .conn
             .query_row("SELECT COUNT(*) FROM left_members WHERE name = ?1", params![id], |row| row.get(0))?;
         Ok(count > 0)
+    }
+
+    /// Bans an account from the server, with the reason (empty for none) and the member who banned it.
+    pub fn ban(&self, id: &str, by: &str, reason: &str, now: u64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO bans (user_id, reason, by_id, at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (user_id) DO UPDATE SET reason = excluded.reason, by_id = excluded.by_id, at = excluded.at",
+            params![id, reason, by, now as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Lets a banned account join again.
+    pub fn unban(&self, id: &str) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM bans WHERE user_id = ?1", params![id]).map(|_| ())
+    }
+
+    /// Whether this account is banned from the server.
+    pub fn is_banned(&self, id: &str) -> rusqlite::Result<bool> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM bans WHERE user_id = ?1", params![id], |row| row.get(0))?;
+        Ok(count > 0)
+    }
+
+    /// Every ban, newest first, with the names of the banned account and of the member who banned it.
+    pub fn bans(&self) -> rusqlite::Result<Vec<common::BanInfo>> {
+        let names = self.display_names()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT user_id, reason, by_id, at FROM bans ORDER BY at DESC, user_id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (user, reason, by, at) = row?;
+            let name = match names.get(&user) {
+                Some(name) => name.clone(),
+                None => self.person_display(&user)?.unwrap_or_else(|| user.clone()),
+            };
+            out.push(common::BanInfo {
+                name,
+                by: names.get(&by).cloned().unwrap_or(by),
+                user,
+                reason,
+                at: at as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The display name kept for an account that is or was a member, if there is one.
+    fn person_display(&self, id: &str) -> rusqlite::Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row("SELECT COALESCE(display, id) FROM people WHERE id = ?1", params![id], |row| row.get(0))
+            .optional()
     }
 
     /// The account asked to join again, so it may be a member once more.

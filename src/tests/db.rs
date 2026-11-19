@@ -817,3 +817,49 @@ mod ordering_tests {
         assert_eq!(names(&group.channels), vec!["x", "y"]);
     }
 }
+
+mod ban_tests {
+    use super::super::*;
+
+    #[test]
+    fn bans_are_listed_with_names_and_can_be_lifted() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("bob", "Bob", 2).unwrap();
+        db.ban("bob", "owner", "spamming", 100).unwrap();
+        assert!(db.is_banned("bob").unwrap());
+        let bans = db.bans().unwrap();
+        assert_eq!(bans.len(), 1);
+        assert_eq!(bans[0].user, "bob");
+        assert_eq!(bans[0].name, "Bob");
+        assert_eq!(bans[0].by, "Owner");
+        assert_eq!(bans[0].reason, "spamming");
+        assert_eq!(bans[0].at, 100);
+        db.unban("bob").unwrap();
+        assert!(!db.is_banned("bob").unwrap());
+        assert!(db.bans().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_member_removed_before_the_ban_keeps_their_name_in_the_list() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("bob", "Bob", 2).unwrap();
+        db.leave_server("bob").unwrap();
+        db.ban("bob", "owner", "", 5).unwrap();
+        let bans = db.bans().unwrap();
+        assert_eq!(bans[0].name, "Bob", "the name the account had here is kept");
+    }
+
+    #[test]
+    fn a_second_ban_replaces_the_first() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("bob", "Bob", 2).unwrap();
+        db.ban("bob", "owner", "first", 1).unwrap();
+        db.ban("bob", "owner", "second", 2).unwrap();
+        let bans = db.bans().unwrap();
+        assert_eq!(bans.len(), 1);
+        assert_eq!(bans[0].reason, "second");
+    }
+}
