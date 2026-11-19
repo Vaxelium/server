@@ -12,6 +12,10 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS left_members (
     name TEXT PRIMARY KEY
 );
+CREATE TABLE IF NOT EXISTS kicked_members (
+    name TEXT PRIMARY KEY,
+    reason TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS bans (
     user_id TEXT PRIMARY KEY,
     reason TEXT NOT NULL DEFAULT '',
@@ -665,9 +669,28 @@ impl Db {
 
     /// The account asked to join again, so it may be a member once more.
     pub fn clear_left(&self, id: &str) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM kicked_members WHERE name = ?1", params![id])?;
         self.conn
             .execute("DELETE FROM left_members WHERE name = ?1", params![id])
             .map(|_| ())
+    }
+
+    /// Records that the account was kicked (not that it left), with the reason given.
+    pub fn mark_kicked(&self, id: &str, reason: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO kicked_members (name, reason) VALUES (?1, ?2)
+             ON CONFLICT (name) DO UPDATE SET reason = excluded.reason",
+            params![id, reason],
+        )?;
+        Ok(())
+    }
+
+    /// The reason the account was kicked, if it was kicked and has not asked to join again.
+    pub fn kicked_reason(&self, id: &str) -> rusqlite::Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row("SELECT reason FROM kicked_members WHERE name = ?1", params![id], |row| row.get(0))
+            .optional()
     }
 
     /// The server's system messages settings. A server that never set any gets the defaults.
