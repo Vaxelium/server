@@ -381,6 +381,22 @@ impl Db {
     /// Remembers that this account has been on the server, and its name for now. Later logins don't
     /// add it again. The first member ever added becomes the owner. The owner never changes after
     /// that. `id` is the account's hidden id.
+    /// Makes the System role if it is not there yet. The system roles sit after @everyone in alphabetical
+    /// order, so System comes after AutoMod, and it has the same permissions as the AutoMod role. Made when
+    /// the connect notice is switched on.
+    pub fn ensure_system_role(&self) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO roles (id, name, color, permissions, position, mentionable, hoisted)
+             VALUES (?1, 'System', '', ?2, -2000000001, 0, 0)",
+            params![common::SYSTEM_ROLE, common::perm::ADMINISTRATOR as i64],
+        )?;
+        self.conn.execute(
+            "UPDATE roles SET position = -2000000001, permissions = ?2 WHERE id = ?1",
+            params![common::SYSTEM_ROLE, common::perm::ADMINISTRATOR as i64],
+        )?;
+        Ok(())
+    }
+
     pub fn add_member(&self, id: &str, display: &str, now: u64) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO members (name, first_seen) VALUES (?1, ?2)",
@@ -816,11 +832,11 @@ impl Db {
             .prepare(
                 "SELECT name FROM members
                  UNION SELECT author FROM messages
-                 WHERE author != ?1 AND author NOT IN (SELECT name FROM left_members)
+                 WHERE author NOT LIKE 'system:%' AND author NOT IN (SELECT name FROM left_members)
                  ORDER BY 1",
             )?;
-        // AutoMod posts as part of the server; it is not a member.
-        let names = stmt.query_map(params![common::AUTOMOD_ID], |row| row.get(0))?;
+        // AutoMod and the server's notices post as the server, under `system:` ids; they are not members.
+        let names = stmt.query_map([], |row| row.get(0))?;
         names.collect()
     }
 
@@ -1200,8 +1216,8 @@ impl Db {
             let mut stmt = self.conn.prepare(sql)?;
             for id in stmt.query_map([], |row| row.get::<_, String>(0))? {
                 let id = id?;
-                // AutoMod's id is the server's own, so it is never looked up.
-                if is_legacy_id(&id) && id != common::AUTOMOD_ID {
+                // The server's own ids (AutoMod, the notices) are never looked up.
+                if is_legacy_id(&id) && !common::is_system_id(&id) {
                     ids.insert(id);
                 }
             }
@@ -1807,7 +1823,17 @@ impl Db {
         })?;
         let mut messages: Vec<ChatMessage> = rows.collect::<rusqlite::Result<_>>()?;
         let names = self.display_names()?;
-        let name_of = |id: &str| names.get(id).cloned().unwrap_or_else(|| id.to_string());
+        let name_of = |id: &str| {
+            if let Some(name) = names.get(id) {
+                return name.clone();
+            }
+            // The server's own accounts show their names, not their ids.
+            match id {
+                common::AUTOMOD_ID => "AutoMod".to_string(),
+                common::NOTICE_ID => "System".to_string(),
+                _ => id.to_string(),
+            }
+        };
         let channel_name = match messages.first() {
             Some(m) => self.channel_name(m.channel_id)?.unwrap_or_default(),
             None => String::new(),

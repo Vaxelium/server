@@ -60,6 +60,37 @@ mod tests {
     }
 
     #[test]
+    fn the_system_roles_come_after_everyone_in_alphabetical_order() {
+        let db = Db::open(":memory:").unwrap();
+        db.ensure_automod_role().unwrap();
+        db.ensure_system_role().unwrap();
+        let roles = db.role_list().unwrap();
+        let system = roles.iter().find(|r| r.id == common::SYSTEM_ROLE).unwrap();
+        assert_eq!(system.permissions & common::perm::ADMINISTRATOR, common::perm::ADMINISTRATOR);
+        let ids: Vec<i64> = roles.iter().map(|r| r.id).collect();
+        let n = ids.len();
+        assert_eq!(&ids[n - 3..], &[common::EVERYONE_ROLE, common::AUTOMOD_ROLE, common::SYSTEM_ROLE]);
+    }
+
+    #[test]
+    fn connect_notices_are_kept_in_the_channel_history() {
+        let db = Db::open(":memory:").unwrap();
+        let welcome = db.ensure_channel("welcome").unwrap();
+        let mut notice = message(&db, "welcome", common::NOTICE_ID, "Dummy connected");
+        notice.author = "System".into();
+        db.save_message(&notice).unwrap();
+        let history = db.history(welcome).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(common::is_notice(&history[0].author_id));
+        assert_eq!(history[0].text, "Dummy connected");
+        // The notice is posted by the server, so it is not listed as a member, the same as AutoMod.
+        assert!(!db.member_names().unwrap().contains(&common::NOTICE_ID.to_string()));
+        assert!(!db.member_names().unwrap().contains(&common::AUTOMOD_ID.to_string()));
+        assert!(common::is_system_id("system:anything"));
+        assert!(!common::is_system_id("0123abcd"));
+    }
+
+    #[test]
     fn automod_reports_are_kept_with_the_message() {
         let db = Db::open(":memory:").unwrap();
         let general = db.ensure_channel("general").unwrap();
@@ -133,6 +164,19 @@ mod tests {
         assert!(db.member_names().unwrap().is_empty(), "no members are left");
         assert!(db.channel_list().unwrap().is_empty(), "no channels are left");
         assert_eq!(db.owner().unwrap(), None, "no owner is left");
+    }
+
+    #[test]
+    fn joining_again_after_leaving_is_a_first_join() {
+        // The join notice is posted when the member is not yet in the members table. Leaving removes
+        // the row, so joining again finds the member not joined and posts the notice again.
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("bob", "Bob", 1).unwrap();
+        assert!(db.is_member("bob").unwrap());
+        db.leave_server("bob").unwrap();
+        assert!(!db.is_member("bob").unwrap());
+        db.clear_left("bob").unwrap();
+        assert!(!db.is_member("bob").unwrap());
     }
 
     #[test]

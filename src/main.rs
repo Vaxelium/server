@@ -419,8 +419,10 @@ where
 
     // The same account may be connected more than once (for example from two windows). Each
     // connection adds one entry to `online`, and the member shows as online while any is open.
-    let (users, server_name, server_description, server_icon) = {
+    let (users, server_name, server_description, server_icon, first_join) = {
         let mut s = state.lock().unwrap();
+        // A member joins once: a later connect is not a new join.
+        let first_join = !s.db.is_member(&user)?;
         s.db.add_member(&user, &display, now_secs())?;
         s.online.push(user.clone());
         (
@@ -428,6 +430,7 @@ where
             s.db.server_name()?,
             s.db.server_description()?,
             s.db.server_icon()?,
+            first_join,
         )
     };
 
@@ -491,12 +494,42 @@ where
     )
     .await?;
     let _ = tx.send(ServerMsg::Presence { users });
+    // The join notice is saved in its channel, so everyone sees it in the history, and it is sent
+    // live to those who have that channel open. Without a channel set, it goes to the first channel.
+    // It is only posted when the member first joins, not on every connect.
     let system = state.lock().unwrap().db.system_messages()?;
-    if system.connect_notice {
-        let _ = tx.send(ServerMsg::System {
-            channel_id: system.channel_id.unwrap_or(channel_id),
-            text: format!("{user} connected"),
-        });
+    if system.connect_notice && first_join {
+        let notice = {
+            let s = state.lock().unwrap();
+            let target = match system.channel_id {
+                Some(id) => Some(id),
+                None => s.db.channel_list()?.first().map(|c| c.id),
+            };
+            match target {
+                Some(id) => s.db.channel_name(id)?.map(|name| (id, name)),
+                None => None,
+            }
+        };
+        if let Some((notice_channel, channel)) = notice {
+            // Servers that had the notice on before the System role existed get the role now.
+            state.lock().unwrap().db.ensure_system_role()?;
+            let mut message = ChatMessage {
+                id: 0,
+                channel_id: notice_channel,
+                channel,
+                author: "System".into(),
+                author_id: common::NOTICE_ID.into(),
+                text: format!("{display} connected"),
+                timestamp: now_secs(),
+                edited: false,
+                reactions: Vec::new(),
+                reply: None,
+                pinned: false,
+                report: None,
+            };
+            message.id = state.lock().unwrap().db.save_message(&message)?;
+            let _ = tx.send(ServerMsg::Message { message });
+        }
     }
 
     loop {
@@ -1353,6 +1386,13 @@ where
                         if missing {
                             send(&mut writer, &ServerMsg::Error { text: "that channel does not exist".into() }).await?;
                             continue;
+                        }
+                        // The System role is made once the connect notice is on, the way the AutoMod role is made
+                        // once a rule is on.
+                        if settings.connect_notice {
+                            let s = state.lock().unwrap();
+                            s.db.ensure_system_role()?;
+                            let _ = tx.send(ServerMsg::Roles { roles: s.db.role_list()? });
                         }
                         send(&mut writer, &ServerMsg::SystemMessages { settings }).await?;
                     }
@@ -2748,7 +2788,7 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
                 return Ok(Err("a role with that name already exists".into()));
             }
             // The AutoMod role is always an administrator, so the bot is not held to channel permissions.
-            let permissions = if role == common::AUTOMOD_ROLE { perm::ADMINISTRATOR } else { permissions };
+            let permissions = if role == common::AUTOMOD_ROLE || role == common::SYSTEM_ROLE { perm::ADMINISTRATOR } else { permissions };
             db.update_role(role, &name, &color, permissions, mentionable, hoisted)?;
             Ok(Ok(()))
         }
@@ -2758,6 +2798,9 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
             }
             if role == common::AUTOMOD_ROLE {
                 return Ok(Err("the AutoMod role belongs to the bot and cannot be deleted".into()));
+            }
+            if role == common::SYSTEM_ROLE {
+                return Ok(Err("the System role belongs to the server and cannot be deleted".into()));
             }
             let Some(index) = index_of(role) else {
                 return Ok(Err(no_role.into()));
@@ -2775,6 +2818,9 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
             if role == common::AUTOMOD_ROLE {
                 return Ok(Err("the AutoMod role stays where it is".into()));
             }
+            if role == common::SYSTEM_ROLE {
+                return Ok(Err("the System role stays where it is".into()));
+            }
             let Some(index) = index_of(role) else {
                 return Ok(Err(no_role.into()));
             };
@@ -2785,7 +2831,7 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
             let mut ids: Vec<i64> = order
                 .iter()
                 .map(|r| r.id)
-                .filter(|&id| id != EVERYONE_ROLE && id != common::AUTOMOD_ROLE)
+                .filter(|&id| id != EVERYONE_ROLE && id != common::AUTOMOD_ROLE && id != common::SYSTEM_ROLE)
                 .collect();
             ids.retain(|&id| id != role);
             let at = match before {
@@ -2814,6 +2860,9 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
             }
             if role == common::AUTOMOD_ROLE {
                 return Ok(Err("the AutoMod role belongs to the bot and cannot be given to members".into()));
+            }
+            if role == common::SYSTEM_ROLE {
+                return Ok(Err("the System role belongs to the server and cannot be given to members".into()));
             }
             let Some(index) = index_of(role) else {
                 return Ok(Err(no_role.into()));
