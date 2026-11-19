@@ -287,6 +287,7 @@ impl Db {
         // Messages made before pins lack this column; they are not pinned. Set to when it was pinned.
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN pinned_at INTEGER", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN report TEXT", []);
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN image BLOB", []);
         // Channels made before they could be ordered lack this column; they keep their name order.
         let _ = conn.execute(
             "ALTER TABLE channels ADD COLUMN position INTEGER NOT NULL DEFAULT 0",
@@ -1574,9 +1575,14 @@ impl Db {
     }
 
     pub fn save_message(&self, m: &ChatMessage) -> rusqlite::Result<i64> {
+        // The picture is kept as PNG bytes, and only when it is valid base64.
+        let image = m
+            .image
+            .as_deref()
+            .and_then(|b64| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok());
         self.conn.execute(
-            "INSERT INTO messages (channel, channel_id, author, text, timestamp, reply_to, report)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO messages (channel, channel_id, author, text, timestamp, reply_to, report, image)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             // Messages are stored under the author's id, so they stay with the account.
             params![
                 m.channel,
@@ -1585,10 +1591,26 @@ impl Db {
                 m.text,
                 m.timestamp as i64,
                 m.reply.as_ref().map(|r| r.id),
-                m.report.as_ref().and_then(|r| serde_json::to_string(r).ok())
+                m.report.as_ref().and_then(|r| serde_json::to_string(r).ok()),
+                image
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The pictures saved with these messages, by message id.
+    fn images_for(&self, ids: &[i64]) -> rusqlite::Result<std::collections::HashMap<i64, Vec<u8>>> {
+        let mut images = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(images);
+        }
+        let list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        let mut stmt = self.conn.prepare(&format!("SELECT id, image FROM messages WHERE image IS NOT NULL AND id IN ({list})"))?;
+        for row in stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))? {
+            let (id, png) = row?;
+            images.insert(id, png);
+        }
+        Ok(images)
     }
 
     /// What a reply to message `id` shows of it, when that message is in `channel`.
@@ -1819,6 +1841,7 @@ impl Db {
                 report: row
                     .get::<_, Option<String>>(10)?
                     .and_then(|json| serde_json::from_str(&json).ok()),
+                image: None,
             })
         })?;
         let mut messages: Vec<ChatMessage> = rows.collect::<rusqlite::Result<_>>()?;
@@ -1830,7 +1853,7 @@ impl Db {
             // The server's own accounts show their names, not their ids.
             match id {
                 common::AUTOMOD_ID => "AutoMod".to_string(),
-                common::NOTICE_ID => "System".to_string(),
+                _ if common::is_notice(id) => "System".to_string(),
                 _ => id.to_string(),
             }
         };
@@ -1850,8 +1873,11 @@ impl Db {
         }
         let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
         let mut reactions = self.reactions_for(&ids)?;
+        // Pictures are only kept for join notices, so most messages have none to load.
+        let mut images = self.images_for(&ids)?;
         for m in &mut messages {
             m.reactions = reactions.remove(&m.id).unwrap_or_default();
+            m.image = images.remove(&m.id).map(|png| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png));
         }
         Ok(messages)
     }

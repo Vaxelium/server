@@ -16,6 +16,7 @@ mod tests {
             reply: None,
             pinned: false,
             report: None,
+            image: None,
         }
     }
 
@@ -73,10 +74,26 @@ mod tests {
     }
 
     #[test]
+    fn a_join_notice_keeps_its_picture_in_the_history() {
+        let db = Db::open(":memory:").unwrap();
+        let welcome = db.ensure_channel("welcome").unwrap();
+        let picture = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"\x89PNG fake bytes");
+        let mut notice = message(&db, "welcome", &common::notice_author("dummy"), "Dummy joined the server");
+        notice.image = Some(picture.clone());
+        db.save_message(&notice).unwrap();
+        db.save_message(&message(&db, "welcome", "bob", "hi")).unwrap();
+        let history = db.history(welcome).unwrap();
+        let with_picture: Vec<_> = history.iter().filter(|m| m.image.is_some()).collect();
+        assert_eq!(with_picture.len(), 1);
+        assert_eq!(with_picture[0].image.as_deref(), Some(picture.as_str()));
+        assert!(history.iter().filter(|m| m.image.is_none()).count() == 1);
+    }
+
+    #[test]
     fn connect_notices_are_kept_in_the_channel_history() {
         let db = Db::open(":memory:").unwrap();
         let welcome = db.ensure_channel("welcome").unwrap();
-        let mut notice = message(&db, "welcome", common::NOTICE_ID, "Dummy connected");
+        let mut notice = message(&db, "welcome", &common::notice_author("dummy"), "Dummy connected");
         notice.author = "System".into();
         db.save_message(&notice).unwrap();
         let history = db.history(welcome).unwrap();
@@ -84,7 +101,7 @@ mod tests {
         assert!(common::is_notice(&history[0].author_id));
         assert_eq!(history[0].text, "Dummy connected");
         // The notice is posted by the server, so it is not listed as a member, the same as AutoMod.
-        assert!(!db.member_names().unwrap().contains(&common::NOTICE_ID.to_string()));
+        assert!(!db.member_names().unwrap().iter().any(|n| common::is_notice(n)));
         assert!(!db.member_names().unwrap().contains(&common::AUTOMOD_ID.to_string()));
         assert!(common::is_system_id("system:anything"));
         assert!(!common::is_system_id("0123abcd"));
@@ -405,6 +422,7 @@ mod rename_tests {
             reply: None,
             pinned: false,
             report: None,
+            image: None,
         };
         db.save_message(&m).unwrap();
 
@@ -438,6 +456,7 @@ mod rename_tests {
             reply: None,
             pinned: false,
             report: None,
+            image: None,
         };
         db.save_message(&m).unwrap();
         assert!(db.delete_channel(general).unwrap());
@@ -570,6 +589,7 @@ mod member_id_tests {
             reply: None,
             pinned: false,
             report: None,
+            image: None,
         })
         .unwrap();
         assert!(db.legacy_ids().unwrap().contains(&"alice".to_string()));
