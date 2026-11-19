@@ -519,7 +519,7 @@ where
                 channel,
                 author: "System".into(),
                 author_id: common::NOTICE_ID.into(),
-                text: format!("{display} connected"),
+                text: format!("{display} joined the server"),
                 timestamp: now_secs(),
                 edited: false,
                 reactions: Vec::new(),
