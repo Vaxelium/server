@@ -1506,10 +1506,6 @@ where
         }
     }
 
-    let _ = tx.send(ServerMsg::System {
-        channel_id,
-        text: format!("{user} disconnected"),
-    });
     Ok(())
 }
 
