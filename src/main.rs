@@ -376,13 +376,15 @@ where
     let (user, mut display) = match serde_json::from_str::<ClientMsg>(&first) {
         Ok(ClientMsg::Connect { token, join }) => match check_session(&state, &auth_addr, &token).await {
             Ok(identity) => {
-                let (deleted, banned, left) = {
+                let (deleted, banned, left, kicked) = {
                     let s = state.lock().unwrap();
                     let left = s.db.has_left(&identity.id)?;
                     if left && join {
                         s.db.clear_left(&identity.id)?;
                     }
-                    (s.db.is_deleted()?, s.db.is_banned(&identity.id)?, left && !join)
+                    let left = left && !join;
+                    let kicked = if left { s.db.kicked_reason(&identity.id)? } else { None };
+                    (s.db.is_deleted()?, s.db.is_banned(&identity.id)?, left, kicked)
                 };
                 if deleted {
                     send(&mut writer, &ServerMsg::Error { text: "this server has been deleted".into() }).await?;
@@ -394,7 +396,12 @@ where
                     return Ok(());
                 }
                 if left {
-                    send(&mut writer, &ServerMsg::NotJoined).await?;
+                    // A kicked account is told so; one that left is told it left.
+                    let reply = match kicked {
+                        Some(reason) => ServerMsg::Kicked { reason },
+                        None => ServerMsg::NotJoined,
+                    };
+                    send(&mut writer, &reply).await?;
                     return Ok(());
                 }
                 session_token = token;
@@ -2916,8 +2923,11 @@ fn remove_member(
     if ban {
         s.db.ban(member, actor, reason, now_secs())?;
     }
-    // Leaving is what a kick is: the member may join again unless they are banned.
+    // A kick is leaving that the member is told about: they may join again unless they are banned.
     s.db.leave_server(member)?;
+    if !ban {
+        s.db.mark_kicked(member, reason)?;
+    }
     let users = s.presence();
     drop(s);
     let _ = tx.send(ServerMsg::Presence { users });

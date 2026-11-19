@@ -863,3 +863,28 @@ mod ban_tests {
         assert_eq!(bans[0].reason, "second");
     }
 }
+
+mod kick_tests {
+    use super::super::*;
+
+    #[test]
+    fn a_kick_is_remembered_with_its_reason_until_the_account_joins_again() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("bob", "Bob", 2).unwrap();
+        db.leave_server("bob").unwrap();
+        db.mark_kicked("bob", "off topic").unwrap();
+        assert_eq!(db.kicked_reason("bob").unwrap().as_deref(), Some("off topic"));
+        db.clear_left("bob").unwrap();
+        assert!(db.kicked_reason("bob").unwrap().is_none());
+    }
+
+    #[test]
+    fn someone_who_left_on_their_own_was_not_kicked() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("bob", "Bob", 2).unwrap();
+        db.leave_server("bob").unwrap();
+        assert!(db.has_left("bob").unwrap());
+        assert!(db.kicked_reason("bob").unwrap().is_none());
+    }
+}
