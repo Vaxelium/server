@@ -376,16 +376,21 @@ where
     let (user, mut display) = match serde_json::from_str::<ClientMsg>(&first) {
         Ok(ClientMsg::Connect { token, join }) => match check_session(&state, &auth_addr, &token).await {
             Ok(identity) => {
-                let (deleted, left) = {
+                let (deleted, banned, left) = {
                     let s = state.lock().unwrap();
                     let left = s.db.has_left(&identity.id)?;
                     if left && join {
                         s.db.clear_left(&identity.id)?;
                     }
-                    (s.db.is_deleted()?, left && !join)
+                    (s.db.is_deleted()?, s.db.is_banned(&identity.id)?, left && !join)
                 };
                 if deleted {
                     send(&mut writer, &ServerMsg::Error { text: "this server has been deleted".into() }).await?;
+                    return Ok(());
+                }
+                // A ban is not undone by asking to join again. Only an administrator can lift it.
+                if banned {
+                    send(&mut writer, &ServerMsg::Error { text: "you are banned from this server".into() }).await?;
                     return Ok(());
                 }
                 if left {
@@ -1273,6 +1278,35 @@ where
                         // Every connection, this one included, is told and closes.
                         let _ = tx.send(ServerMsg::ServerDeleted);
                     }
+                    ClientMsg::Kick { user: member, reason } => {
+                        if let Err(text) = remove_member(&state, &tx, &user, &member, &clean_reason(reason), false)? {
+                            send(&mut writer, &ServerMsg::Error { text }).await?;
+                        }
+                    }
+
+                    ClientMsg::Ban { user: member, reason } => {
+                        if let Err(text) = remove_member(&state, &tx, &user, &member, &clean_reason(reason), true)? {
+                            send(&mut writer, &ServerMsg::Error { text }).await?;
+                        }
+                    }
+
+                    ClientMsg::Unban { user: member } => {
+                        if !may(&state, &user, perm::BAN_MEMBERS)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_BAN_PERMISSION.into() }).await?;
+                            continue;
+                        }
+                        state.lock().unwrap().db.unban(&member)?;
+                    }
+
+                    ClientMsg::GetBans => {
+                        if !may(&state, &user, perm::BAN_MEMBERS)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_BAN_PERMISSION.into() }).await?;
+                            continue;
+                        }
+                        let bans = state.lock().unwrap().db.bans()?;
+                        send(&mut writer, &ServerMsg::Bans { bans }).await?;
+                    }
+
                     ClientMsg::LeaveServer => {
                         let owner = state.lock().unwrap().db.info_value("owner")?;
                         if owner.as_deref() == Some(user.as_str()) {
@@ -1545,6 +1579,13 @@ where
                             visible_layout(&access, s.db.categories()?, s.db.uncategorized_channels()?)
                         };
                         send(&mut writer, &ServerMsg::Categories { categories, uncategorized }).await?;
+                    }
+                    Ok(ServerMsg::Removed { user: removed, banned, reason }) => {
+                        // Only the member removed is told, and their connection ends.
+                        if removed == user {
+                            send(&mut writer, &ServerMsg::Removed { user: removed, banned, reason }).await?;
+                            break;
+                        }
                     }
                     Ok(ServerMsg::ServerDeleted) => {
                         send(&mut writer, &ServerMsg::ServerDeleted).await?;
@@ -2820,6 +2861,72 @@ fn normalize_channel(name: &str) -> String {
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
         .take(32)
         .collect()
+}
+
+/// The longest reason given for a kick or ban, in characters.
+const MAX_REMOVAL_REASON_LEN: usize = 200;
+const NO_BAN_PERMISSION: &str = "you need the Ban Members permission for that";
+const NO_KICK_PERMISSION: &str = "you need the Kick Members permission for that";
+
+/// A reason as typed: trimmed, and kept to a sensible length. Empty when none was given.
+fn clean_reason(reason: Option<String>) -> String {
+    reason
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(MAX_REMOVAL_REASON_LEN)
+        .collect()
+}
+
+/// Removes a member from the server, and bans them too when `ban` is set. The actor needs the matching
+/// permission, and the member's highest role must be below theirs. The owner cannot be removed. Everyone
+/// is told; the member removed is told last, and their connection ends.
+fn remove_member(
+    state: &SharedState,
+    tx: &broadcast::Sender<ServerMsg>,
+    actor: &str,
+    member: &str,
+    reason: &str,
+    ban: bool,
+) -> rusqlite::Result<Result<(), String>> {
+    let s = state.lock().unwrap();
+    let order = s.db.role_list()?;
+    let power = power_of(&s.db, actor, &order)?;
+    let (needed, text) = if ban {
+        (perm::BAN_MEMBERS, NO_BAN_PERMISSION)
+    } else {
+        (perm::KICK_MEMBERS, NO_KICK_PERMISSION)
+    };
+    if !power.has(needed) {
+        return Ok(Err(text.into()));
+    }
+    if member == actor {
+        return Ok(Err("you cannot remove yourself".into()));
+    }
+    if !s.db.is_member(member)? {
+        return Ok(Err("that person is not a member of this server".into()));
+    }
+    let target = power_of(&s.db, member, &order)?;
+    if target.owner {
+        return Ok(Err("the owner cannot be kicked or banned".into()));
+    }
+    if !target.top.map_or(true, |top| power.outranks(top)) {
+        return Ok(Err("that member's highest role is not below yours".into()));
+    }
+    if ban {
+        s.db.ban(member, actor, reason, now_secs())?;
+    }
+    // Leaving is what a kick is: the member may join again unless they are banned.
+    s.db.leave_server(member)?;
+    let users = s.presence();
+    drop(s);
+    let _ = tx.send(ServerMsg::Presence { users });
+    let _ = tx.send(ServerMsg::Removed {
+        user: member.to_string(),
+        banned: ban,
+        reason: reason.to_string(),
+    });
+    Ok(Ok(()))
 }
 
 fn now_secs() -> u64 {
