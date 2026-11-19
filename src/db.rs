@@ -432,18 +432,6 @@ impl Db {
         rows.collect()
     }
 
-    /// The owner of this server, by id, if anyone has joined it yet.
-    /// Remembers the display name of someone who is not a member of this server, such as the
-    /// sender of a direct message relayed from another server.
-    pub fn add_person(&self, id: &str, display: &str) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "INSERT INTO people (id, display) VALUES (?1, ?2)
-             ON CONFLICT (id) DO UPDATE SET display = excluded.display",
-            params![id, display],
-        )?;
-        Ok(())
-    }
-
     /// Whether this server has a member with this account id.
     pub fn is_member(&self, id: &str) -> rusqlite::Result<bool> {
         let count: i64 = self
@@ -452,51 +440,6 @@ impl Db {
                 row.get(0)
             })?;
         Ok(count > 0)
-    }
-
-    /// The two members of a direct message channel, if it is one.
-    pub fn direct_message_pair(&self, channel: &str) -> rusqlite::Result<Option<(String, String)>> {
-        use rusqlite::OptionalExtension;
-        let Some(id) = channel.strip_prefix("dm-").and_then(|n| n.parse::<i64>().ok()) else {
-            return Ok(None);
-        };
-        self.conn
-            .query_row("SELECT a, b FROM direct_messages WHERE id = ?1", params![id], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .optional()
-    }
-
-    /// Whether a direct message has a member who is not on this server. Such a conversation is
-    /// kept in step with the other server, so it cannot be edited, deleted or reacted to.
-    pub fn cross_server_dm(&self, channel: &str) -> rusqlite::Result<bool> {
-        let Some(id) = channel.strip_prefix("dm-").and_then(|n| n.parse::<i64>().ok()) else {
-            return Ok(false);
-        };
-        let cross: i64 = self
-            .conn
-            .query_row("SELECT cross FROM direct_messages WHERE id = ?1", params![id], |row| {
-                row.get(0)
-            })
-            .unwrap_or(0);
-        Ok(cross != 0)
-    }
-
-    /// The direct message channel between two members, created the first time. A conversation
-    /// with someone who is not a member of this server is marked as cross-server.
-    pub fn open_direct_message(&self, a: &str, b: &str) -> rusqlite::Result<String> {
-        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-        let cross = !(self.is_member(lo)? && self.is_member(hi)?);
-        self.conn.execute(
-            "INSERT OR IGNORE INTO direct_messages (a, b, cross) VALUES (?1, ?2, ?3)",
-            params![lo, hi, cross as i64],
-        )?;
-        let id: i64 = self.conn.query_row(
-            "SELECT id FROM direct_messages WHERE a = ?1 AND b = ?2",
-            params![lo, hi],
-            |row| row.get(0),
-        )?;
-        Ok(format!("dm-{id}"))
     }
 
     /// Whether `user` is one of the two members of a direct message channel.
@@ -510,40 +453,6 @@ impl Db {
             |row| row.get(0),
         )?;
         Ok(count > 0)
-    }
-
-    /// The direct message channels `user` is part of, each with the other member's id and when
-    /// its last message was sent (0 if none). The most recent conversation comes first.
-    pub fn direct_messages_of(&self, user: &str) -> rusqlite::Result<Vec<(String, String, u64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT d.id, d.a, d.b, COALESCE(MAX(m.timestamp), 0) AS last
-             FROM direct_messages d
-             LEFT JOIN messages m ON m.channel = 'dm-' || d.id
-             WHERE d.a = ?1 OR d.b = ?1
-             GROUP BY d.id
-             ORDER BY last DESC, d.id DESC",
-        )?;
-        let rows = stmt.query_map(params![user], |row| {
-            let id: i64 = row.get(0)?;
-            let a: String = row.get(1)?;
-            let b: String = row.get(2)?;
-            let last: i64 = row.get(3)?;
-            let other = if a == user { b } else { a };
-            Ok((format!("dm-{id}"), other, last as u64))
-        })?;
-        rows.collect()
-    }
-
-    /// The member whose display name is `display`, if there is one.
-    pub fn member_by_display(&self, display: &str) -> rusqlite::Result<Option<String>> {
-        use rusqlite::OptionalExtension;
-        self.conn
-            .query_row(
-                "SELECT name FROM members WHERE COALESCE(display, name) = ?1 LIMIT 1",
-                params![display],
-                |row| row.get(0),
-            )
-            .optional()
     }
 
     /// The channel a message is in, if the message exists.

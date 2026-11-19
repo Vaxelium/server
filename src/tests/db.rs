@@ -130,24 +130,6 @@ mod tests {
     }
 
     #[test]
-    fn direct_messages_are_for_their_two_members_only() {
-        let db = Db::open(":memory:").unwrap();
-        db.add_member("owner", "Owner", 1).unwrap();
-        let dm = db.open_direct_message("alice", "bob").unwrap();
-        let dm_id = db.ensure_channel(&dm).unwrap();
-        let general = db.ensure_channel("general").unwrap();
-
-        let in_dm = db.save_message(&message(&db, &dm, "alice", "hi")).unwrap();
-        let in_channel = db.save_message(&message(&db, "general", "alice", "hi")).unwrap();
-
-        // The owner (not in the DM) cannot delete it; the owner can delete a channel message.
-        assert_eq!(db.delete_message(in_dm, "owner", true).unwrap(), None);
-        assert_eq!(db.delete_message(in_channel, "owner", true).unwrap(), Some(general));
-        // The author can delete their own direct message.
-        assert_eq!(db.delete_message(in_dm, "alice", false).unwrap(), Some(dm_id));
-    }
-
-    #[test]
     fn automod_is_not_a_member() {
         let db = Db::open(":memory:").unwrap();
         db.save_message(&message(&db, "general", "alice", "hi")).unwrap();
@@ -574,7 +556,6 @@ mod member_id_tests {
     fn stored_legacy_ids_are_found_and_replaced() {
         let db = Db::open(":memory:").unwrap();
         db.add_member("alice", "Alice", 1).unwrap();
-        let dm = db.open_direct_message("alice", "bob").unwrap();
         let general = db.ensure_channel("general").unwrap();
         db.save_message(&ChatMessage {
             id: 0,
@@ -606,7 +587,6 @@ mod member_id_tests {
             new_id,
             "messages follow the new id"
         );
-        assert!(db.is_dm_member(&dm, &new_id).unwrap(), "direct messages follow it too");
     }
 }
 
