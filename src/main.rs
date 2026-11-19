@@ -1,3 +1,4 @@
+mod card;
 mod db;
 mod discovery;
 mod web;
@@ -513,12 +514,32 @@ where
         if let Some((notice_channel, channel)) = notice {
             // Servers that had the notice on before the System role existed get the role now.
             state.lock().unwrap().db.ensure_system_role()?;
+            // The welcome card: the member's avatar, the server's name and how many members it has. If the
+            // avatar or the card can't be had, the notice is just its text.
+            let (server_name, count) = {
+                let s = state.lock().unwrap();
+                (s.db.server_name()?, s.db.member_names()?.len() as u64)
+            };
+            let (avatar, banner) = match auth_call(&state, &auth_addr, &AuthRequest::ProfileCard { id: user.clone(), token: String::new() }).await {
+                Ok(AuthReply::ProfileCard { avatar, banner, .. }) => {
+                    let picture = if avatar.is_empty() {
+                        None
+                    } else {
+                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, avatar).ok()
+                    };
+                    (picture, banner)
+                }
+                _ => (None, String::new()),
+            };
+            let member = card::Member { names: vec![display.clone()], avatar, banner };
+            let picture = tokio::task::spawn_blocking(move || card::welcome(&member, &server_name, count)).await.ok().flatten();
+            let image = picture.map(|png| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png));
             let mut message = ChatMessage {
                 id: 0,
                 channel_id: notice_channel,
                 channel,
                 author: "System".into(),
-                author_id: common::NOTICE_ID.into(),
+                author_id: common::notice_author(&user),
                 text: format!("{display} joined the server"),
                 timestamp: now_secs(),
                 edited: false,
@@ -526,6 +547,7 @@ where
                 reply: None,
                 pinned: false,
                 report: None,
+                image,
             };
             message.id = state.lock().unwrap().db.save_message(&message)?;
             let _ = tx.send(ServerMsg::Message { message });
@@ -1061,6 +1083,7 @@ where
                             reply: None,
                             pinned: false,
                             report: None,
+                            image: None,
                         };
                         // A reply must answer a message in the same channel; anything else is sent plain.
                         if let Some(id) = reply_to {
@@ -1849,6 +1872,7 @@ async fn relay_receive(
             reply: None,
             pinned: false,
             report: None,
+            image: None,
         };
         message.id = s.db.save_message(&message).map_err(|e| e.to_string())?;
         message
@@ -2427,6 +2451,7 @@ fn automod_post(
             reply: None,
             pinned: false,
             report,
+            image: None,
         };
         message.id = s.db.save_message(&message)?;
         message
