@@ -2374,8 +2374,20 @@ fn automod_refusal(
                 notice: rules.filtered.notice.clone(),
                 block: rules.filtered.block,
                 alert: rules.filtered.send_alert,
-                rule: "AutoMod Filtered Words",
+                rule: "AutoMod Filtered Patterns",
                 keyword: matched,
+            }));
+        }
+    }
+    if let Some(word) = rules.words.find(text) {
+        if exemptions_apply(state, user, channel, &rules.words.allowed_roles, &rules.words.allowed_channels)? {
+            return Ok(Some(Refusal {
+                reason: format!("AutoMod: your message uses a filtered word: “{word}”"),
+                notice: rules.words.notice.clone(),
+                block: rules.words.block,
+                alert: rules.words.send_alert,
+                rule: "AutoMod Filtered Words",
+                keyword: word,
             }));
         }
     }

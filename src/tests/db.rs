@@ -122,7 +122,11 @@ mod tests {
             "nothing is switched on at first"
         );
         let rules = common::AutoMod {
-            blocked_words: vec!["bad".into()],
+            words: common::WordRule {
+                enabled: true,
+                words: vec!["bad".into()],
+                ..common::WordRule::default()
+            },
             block_links: true,
             spam_filter: true,
             names: common::NameRule {
