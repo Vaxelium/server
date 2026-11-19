@@ -379,8 +379,24 @@ where
     // Handshake: otherwise the first message must be a Connect carrying a session token.
     let session_token: String;
     let (user, mut display) = match serde_json::from_str::<ClientMsg>(&first) {
-        Ok(ClientMsg::Connect { token }) => match check_session(&state, &auth_addr, &token).await {
+        Ok(ClientMsg::Connect { token, join }) => match check_session(&state, &auth_addr, &token).await {
             Ok(identity) => {
+                let (deleted, left) = {
+                    let s = state.lock().unwrap();
+                    let left = s.db.has_left(&identity.id)?;
+                    if left && join {
+                        s.db.clear_left(&identity.id)?;
+                    }
+                    (s.db.is_deleted()?, left && !join)
+                };
+                if deleted {
+                    send(&mut writer, &ServerMsg::Error { text: "this server has been deleted".into() }).await?;
+                    return Ok(());
+                }
+                if left {
+                    send(&mut writer, &ServerMsg::NotJoined).await?;
+                    return Ok(());
+                }
                 session_token = token;
                 (identity.id, identity.name)
             }
@@ -475,10 +491,13 @@ where
     )
     .await?;
     let _ = tx.send(ServerMsg::Presence { users });
-    let _ = tx.send(ServerMsg::System {
-        channel_id,
-        text: format!("{user} connected"),
-    });
+    let system = state.lock().unwrap().db.system_messages()?;
+    if system.connect_notice {
+        let _ = tx.send(ServerMsg::System {
+            channel_id: system.channel_id.unwrap_or(channel_id),
+            text: format!("{user} connected"),
+        });
+    }
 
     loop {
         tokio::select! {
@@ -1256,6 +1275,87 @@ where
                         }
                         send(&mut writer, &ServerMsg::AutoMod { rules }).await?;
                     }
+                    ClientMsg::TransferOwnership { id } => {
+                        let (owner, member) = {
+                            let s = state.lock().unwrap();
+                            (s.db.owner()?, s.db.is_member(&id)?)
+                        };
+                        if owner.as_deref() != Some(user.as_str()) {
+                            send(&mut writer, &ServerMsg::Error { text: "only the owner can make someone else the owner".into() })
+                                .await?;
+                            continue;
+                        }
+                        if !member {
+                            send(&mut writer, &ServerMsg::Error { text: "that person is not a member of this server".into() })
+                                .await?;
+                            continue;
+                        }
+                        let users = {
+                            let s = state.lock().unwrap();
+                            s.db.transfer_ownership(&id)?;
+                            s.presence()
+                        };
+                        let _ = tx.send(ServerMsg::Presence { users });
+                    }
+                    ClientMsg::DeleteServer => {
+                        let owner = state.lock().unwrap().db.owner()?;
+                        if owner.as_deref() != Some(user.as_str()) {
+                            send(&mut writer, &ServerMsg::Error { text: "only the owner can delete the server".into() })
+                                .await?;
+                            continue;
+                        }
+                        state.lock().unwrap().db.delete_server()?;
+                        // Every connection, this one included, is told and closes.
+                        let _ = tx.send(ServerMsg::ServerDeleted);
+                    }
+                    ClientMsg::LeaveServer => {
+                        let owner = state.lock().unwrap().db.info_value("owner")?;
+                        if owner.as_deref() == Some(user.as_str()) {
+                            send(&mut writer, &ServerMsg::Error { text: "the owner cannot leave the server".into() })
+                                .await?;
+                            continue;
+                        }
+                        let users = {
+                            let s = state.lock().unwrap();
+                            s.db.leave_server(&user)?;
+                            s.presence()
+                        };
+                        // Everyone's member list drops the leaver now, not when this connection closes.
+                        let _ = tx.send(ServerMsg::Presence { users });
+                        send(&mut writer, &ServerMsg::Left).await?;
+                        // Ends this connection. Its presence is sent as it closes, with the account gone.
+                        break;
+                    }
+                    ClientMsg::GetSystemMessages => {
+                        if !may(&state, &user, perm::MANAGE_SERVER)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_SYSTEM_PERMISSION.into() }).await?;
+                            continue;
+                        }
+                        let settings = state.lock().unwrap().db.system_messages()?;
+                        send(&mut writer, &ServerMsg::SystemMessages { settings }).await?;
+                    }
+                    ClientMsg::SetSystemMessages { settings } => {
+                        if !may(&state, &user, perm::MANAGE_SERVER)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_SYSTEM_PERMISSION.into() }).await?;
+                            continue;
+                        }
+                        // The lock is released before anything is sent.
+                        let missing = {
+                            let s = state.lock().unwrap();
+                            match settings.channel_id {
+                                Some(id) if s.db.channel_name(id)?.is_none() => true,
+                                _ => {
+                                    s.db.set_system_messages(&settings)?;
+                                    false
+                                }
+                            }
+                        };
+                        if missing {
+                            send(&mut writer, &ServerMsg::Error { text: "that channel does not exist".into() }).await?;
+                            continue;
+                        }
+                        send(&mut writer, &ServerMsg::SystemMessages { settings }).await?;
+                    }
                     ClientMsg::Pin { id, pinned } => {
                         // Blocked without a notice: AutoMod only speaks up when a message is sent.
                         if name_block(&state, &user, &display)?.is_some() {
@@ -1481,6 +1581,10 @@ where
                             visible_layout(&access, s.db.categories()?, s.db.uncategorized_channels()?)
                         };
                         send(&mut writer, &ServerMsg::Categories { categories, uncategorized }).await?;
+                    }
+                    Ok(ServerMsg::ServerDeleted) => {
+                        send(&mut writer, &ServerMsg::ServerDeleted).await?;
+                        break;
                     }
                     Ok(ServerMsg::ChannelDeleted { id }) => {
                         // A connection that had the channel open moves to general.
@@ -2292,6 +2396,7 @@ fn automod_post(
 }
 
 const NO_AUTOMOD_PERMISSION: &str = "you need the Manage Server permission to change AutoMod";
+const NO_SYSTEM_PERMISSION: &str = "you need the Manage Server permission to change system messages";
 
 /// Why the server's automatic moderation refuses `text` from `user` in `channel`, or None when it may
 /// go. Members who may manage messages there are not checked, nor are direct messages. When
