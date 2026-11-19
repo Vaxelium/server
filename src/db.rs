@@ -9,6 +9,9 @@ const DEFAULT_CHANNELS: [&str; 2] = ["general", "random"];
 const DEFAULT_SERVER_NAME: &str = "My server";
 
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS left_members (
+    name TEXT PRIMARY KEY
+);
 CREATE TABLE IF NOT EXISTS members (
     name       TEXT PRIMARY KEY,
     first_seen INTEGER NOT NULL
@@ -607,6 +610,89 @@ impl Db {
         self.set_server_info("automod", &json)
     }
 
+    /// Whether the owner has deleted this server. A deleted server refuses connections.
+    pub fn is_deleted(&self) -> rusqlite::Result<bool> {
+        Ok(self.info_value("deleted")?.as_deref() == Some("1"))
+    }
+
+    /// Makes `id` the owner. The caller checks that they are a member.
+    pub fn transfer_ownership(&self, id: &str) -> rusqlite::Result<()> {
+        self.set_server_info("owner", id)
+    }
+
+    /// Deletes everything the server holds: every table but its settings, and then the settings too, except that it
+    /// is marked deleted so it refuses connections from now on.
+    pub fn delete_server(&self) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let tables: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name <> 'server_info'")?;
+            let names = stmt.query_map([], |row| row.get(0))?;
+            names.collect::<rusqlite::Result<_>>()?
+        };
+        for table in tables {
+            tx.execute(&format!("DELETE FROM \"{table}\""), [])?;
+        }
+        tx.execute("DELETE FROM server_info WHERE key <> 'server_id'", [])?;
+        tx.execute(
+            "INSERT INTO server_info (key, value) VALUES ('deleted', '1')",
+            [],
+        )?;
+        tx.commit()
+    }
+
+    /// Removes an account from the server: its membership and what it held here. Its messages stay.
+    pub fn leave_server(&self, id: &str) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        // Their name is kept for the messages they wrote, which still show it.
+        tx.execute(
+            "INSERT INTO people (id, display)
+             SELECT name, COALESCE(display, name) FROM members WHERE name = ?1
+             ON CONFLICT (id) DO UPDATE SET display = excluded.display",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM members WHERE name = ?1", params![id])?;
+        tx.execute("DELETE FROM member_roles WHERE user_id = ?1", params![id])?;
+        tx.execute("DELETE FROM member_badges WHERE user_id = ?1", params![id])?;
+        tx.execute("DELETE FROM channel_member_overrides WHERE member_id = ?1", params![id])?;
+        tx.execute("DELETE FROM category_member_overrides WHERE member_id = ?1", params![id])?;
+        tx.execute("DELETE FROM user_status WHERE user_id = ?1", params![id])?;
+        tx.execute("INSERT OR IGNORE INTO left_members (name) VALUES (?1)", params![id])?;
+        tx.commit()
+    }
+
+    /// Whether this account left the server and has not asked to join again.
+    pub fn has_left(&self, id: &str) -> rusqlite::Result<bool> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM left_members WHERE name = ?1", params![id], |row| row.get(0))?;
+        Ok(count > 0)
+    }
+
+    /// The account asked to join again, so it may be a member once more.
+    pub fn clear_left(&self, id: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM left_members WHERE name = ?1", params![id])
+            .map(|_| ())
+    }
+
+    /// The server's system messages settings. A server that never set any gets the defaults.
+    pub fn system_messages(&self) -> rusqlite::Result<common::SystemMessages> {
+        let stored: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM server_info WHERE key = 'system_messages'", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(stored
+            .and_then(|json| serde_json::from_str::<common::SystemMessages>(&json).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn set_system_messages(&self, settings: &common::SystemMessages) -> rusqlite::Result<()> {
+        let json = serde_json::to_string(settings).unwrap_or_default();
+        self.set_server_info("system_messages", &json)
+    }
+
     /// The server icon as base64 PNG, or `None` when the server has no icon.
     pub fn server_icon(&self) -> rusqlite::Result<Option<String>> {
         let icon: String =
@@ -727,7 +813,12 @@ impl Db {
     pub fn member_names(&self) -> rusqlite::Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT name FROM members UNION SELECT author FROM messages WHERE author != ?1 ORDER BY 1")?;
+            .prepare(
+                "SELECT name FROM members
+                 UNION SELECT author FROM messages
+                 WHERE author != ?1 AND author NOT IN (SELECT name FROM left_members)
+                 ORDER BY 1",
+            )?;
         // AutoMod posts as part of the server; it is not a member.
         let names = stmt.query_map(params![common::AUTOMOD_ID], |row| row.get(0))?;
         names.collect()

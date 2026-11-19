@@ -114,6 +114,62 @@ mod tests {
     }
 
     #[test]
+    fn ownership_passes_to_another_member() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("bob", "Bob", 2).unwrap();
+        db.transfer_ownership("bob").unwrap();
+        assert_eq!(db.owner().unwrap().as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn deleting_the_server_removes_everything_and_refuses_later_connections() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("bob", "Bob", 2).unwrap();
+        assert!(!db.is_deleted().unwrap());
+        db.delete_server().unwrap();
+        assert!(db.is_deleted().unwrap());
+        assert!(db.member_names().unwrap().is_empty(), "no members are left");
+        assert!(db.channel_list().unwrap().is_empty(), "no channels are left");
+        assert_eq!(db.owner().unwrap(), None, "no owner is left");
+    }
+
+    #[test]
+    fn leaving_removes_the_membership_and_what_it_held() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("bob", "Bob", 2).unwrap();
+        // Bob has posted, which used to keep him in the member list after he left.
+        db.save_message(&message(&db, "general", "bob", "hello")).unwrap();
+        db.leave_server("bob").unwrap();
+        let members = db.member_names().unwrap();
+        assert!(members.contains(&"owner".to_string()));
+        assert!(!members.contains(&"bob".to_string()), "bob is no longer a member");
+        assert!(db.has_left("bob").unwrap(), "bob stays out until asked back");
+        assert_eq!(
+            db.display_names().unwrap().get("bob").map(String::as_str),
+            Some("Bob"),
+            "bob's messages still show his name"
+        );
+        db.clear_left("bob").unwrap();
+        assert!(!db.has_left("bob").unwrap());
+    }
+
+    #[test]
+    fn system_messages_default_to_connection_notices_in_the_member_channel() {
+        let db = Db::open(":memory:").unwrap();
+        assert_eq!(db.system_messages().unwrap(), common::SystemMessages::default());
+        let general = db.channel_id("general").unwrap().unwrap();
+        let settings = common::SystemMessages {
+            connect_notice: false,
+            channel_id: Some(general),
+        };
+        db.set_system_messages(&settings).unwrap();
+        assert_eq!(db.system_messages().unwrap(), settings);
+    }
+
+    #[test]
     fn automod_rules_are_kept() {
         let db = Db::open(":memory:").unwrap();
         assert_eq!(
