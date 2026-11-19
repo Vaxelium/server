@@ -378,7 +378,7 @@ where
 
     // Handshake: otherwise the first message must be a Connect carrying a session token.
     let session_token: String;
-    let (user, display) = match serde_json::from_str::<ClientMsg>(&first) {
+    let (user, mut display) = match serde_json::from_str::<ClientMsg>(&first) {
         Ok(ClientMsg::Connect { token }) => match check_session(&state, &auth_addr, &token).await {
             Ok(identity) => {
                 session_token = token;
@@ -1027,6 +1027,25 @@ where
                         let text: String = text.trim().chars().take(common::MAX_STATUS_TEXT_LEN).collect();
                         let _ = tx.send(ServerMsg::ProfileStatus { user: user.clone(), text });
                     }
+                    ClientMsg::SetDisplayName { name } => {
+                        let name = name.trim().to_string();
+                        if name.is_empty() || name.chars().count() > common::MAX_DISPLAY_NAME_LEN {
+                            send(&mut writer, &ServerMsg::Error {
+                                text: format!("name must be 1-{} characters", common::MAX_DISPLAY_NAME_LEN),
+                            })
+                            .await?;
+                            continue;
+                        }
+                        // Saved for everyone, then every connection of this account is told, so its sends use the
+                        // new name. The member list is sent again with it.
+                        {
+                            let s = state.lock().unwrap();
+                            s.db.add_member(&user, &name, now_secs())?;
+                            let _ = tx.send(ServerMsg::MemberRenamed { id: user.clone(), name: name.clone() });
+                            let _ = tx.send(ServerMsg::Presence { users: s.presence() });
+                        }
+                        display = name;
+                    }
                     ClientMsg::SetStatus { status } => {
                         let users = {
                             let s = state.lock().unwrap();
@@ -1422,6 +1441,15 @@ where
                     }
                     Ok(overrides @ ServerMsg::CategoryOverrides { .. }) => {
                         send(&mut writer, &overrides).await?;
+                    }
+                    Ok(msg @ ServerMsg::MemberRenamed { .. }) => {
+                        // This connection's own sends use the new name from now on.
+                        if let ServerMsg::MemberRenamed { id, name } = &msg {
+                            if *id == user {
+                                display = name.clone();
+                            }
+                        }
+                        send(&mut writer, &msg).await?;
                     }
                     Ok(overrides @ ServerMsg::MemberOverrides { .. }) => {
                         send(&mut writer, &overrides).await?;

@@ -20,6 +20,14 @@ mod tests {
     }
 
     #[test]
+    fn a_renamed_member_shows_the_new_name_to_everyone() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("acct-1", "Old name", 1).unwrap();
+        db.add_member("acct-1", "New name", 2).unwrap();
+        assert_eq!(db.display_names().unwrap().get("acct-1").map(String::as_str), Some("New name"));
+    }
+
+    #[test]
     fn the_automod_role_is_always_an_administrator() {
         let db = Db::open(":memory:").unwrap();
         db.ensure_automod_role().unwrap();
