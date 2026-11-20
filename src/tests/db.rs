@@ -888,3 +888,55 @@ mod kick_tests {
         assert!(db.kicked_reason("bob").unwrap().is_none());
     }
 }
+
+mod slow_mode_tests {
+    use super::super::*;
+
+    #[test]
+    fn a_channel_has_no_slow_mode_until_one_is_set_and_clearing_it_removes_it() {
+        let db = Db::open(":memory:").unwrap();
+        let general = db.ensure_channel("general").unwrap();
+        assert_eq!(db.slow_mode(general).unwrap(), 0);
+        assert!(db.slow_modes().unwrap().is_empty());
+
+        assert!(db.set_slow_mode(general, 30).unwrap());
+        assert_eq!(db.slow_mode(general).unwrap(), 30);
+        assert_eq!(db.slow_modes().unwrap(), vec![common::SlowMode { channel_id: general, seconds: 30 }]);
+
+        assert!(db.set_slow_mode(general, 0).unwrap());
+        assert_eq!(db.slow_mode(general).unwrap(), 0);
+        assert!(db.slow_modes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn slow_mode_on_a_missing_channel_is_refused() {
+        let db = Db::open(":memory:").unwrap();
+        assert!(!db.set_slow_mode(999, 30).unwrap());
+        assert_eq!(db.slow_mode(999).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_database_from_before_slow_mode_gets_the_column_and_keeps_its_channels() {
+        let path = std::env::temp_dir().join(format!("vaxelium-slow-mode-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE channels (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name        TEXT NOT NULL UNIQUE,
+                    category_id INTEGER,
+                    position    INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO channels (name, position) VALUES ('general', 1);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(path.to_str().unwrap()).unwrap();
+        let general = db.channel_id("general").unwrap().unwrap();
+        assert!(db.set_slow_mode(general, 60).unwrap());
+        assert_eq!(db.slow_mode(general).unwrap(), 60);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+}

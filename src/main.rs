@@ -43,6 +43,9 @@ struct State {
     mention_log: HashMap<String, std::collections::VecDeque<(u64, usize)>>,
     /// Members AutoMod has timed out from sending, and until when (Unix seconds).
     timeouts: HashMap<String, u64>,
+    /// When each member last sent a message in each channel with slow mode, as (channel id, member id)
+    /// to Unix seconds.
+    slow_last: HashMap<(i64, String), u64>,
 }
 
 impl State {
@@ -255,6 +258,7 @@ async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         name_alerts: std::collections::HashSet::new(),
         mention_log: HashMap::new(),
         timeouts: HashMap::new(),
+        slow_last: HashMap::new(),
     }));
     {
         let s = state.lock().unwrap();
@@ -470,6 +474,8 @@ where
     send(&mut writer, &ServerMsg::Badges { badges }).await?;
     let overrides = state.lock().unwrap().db.channel_overrides()?;
     send(&mut writer, &ServerMsg::ChannelOverrides { overrides }).await?;
+    let modes = state.lock().unwrap().db.slow_modes()?;
+    send(&mut writer, &ServerMsg::SlowModes { modes }).await?;
     let overrides = state.lock().unwrap().db.category_overrides()?;
     send(&mut writer, &ServerMsg::CategoryOverrides { overrides }).await?;
     let (channels, categories) = {
@@ -985,6 +991,24 @@ where
                             .await?;
                             continue;
                         }
+                        // Slow mode: each member waits this long after their last message in the channel. Members
+                        // with the Bypass Slow Mode permission (or Manage Messages) there are not held to it.
+                        let slow = state.lock().unwrap().db.slow_mode(channel_id)?;
+                        if slow > 0
+                            && !may_in_channel(&state, &user, channel_id, perm::BYPASS_SLOW_MODE)?
+                            && !may_in_channel(&state, &user, channel_id, perm::MANAGE_MESSAGES)?
+                        {
+                            let now = now_secs();
+                            let last = state.lock().unwrap().slow_last.get(&(channel_id, user.clone())).copied();
+                            if let Some(last) = last.filter(|&last| now.saturating_sub(last) < slow) {
+                                let wait = slow - now.saturating_sub(last);
+                                send(&mut writer, &ServerMsg::Error {
+                                    text: format!("slow mode: you can send again in {wait} seconds"),
+                                })
+                                .await?;
+                                continue;
+                            }
+                        }
                         if let Some(refusal) = automod_refusal(&state, &user, channel_id, &text, Some(&mut recent_sends))? {
                             if refusal.alert {
                                 report_block(
@@ -1025,6 +1049,9 @@ where
                             message.reply = state.lock().unwrap().db.reply_ref(id, channel_id)?;
                         }
                         message.id = state.lock().unwrap().db.save_message(&message)?;
+                        if slow > 0 {
+                            state.lock().unwrap().slow_last.insert((channel_id, user.clone()), now_secs());
+                        }
                         let _ = tx.send(ServerMsg::Message { message });
                     }
                     ClientMsg::SetProfileStatus { text } => {
@@ -1064,6 +1091,34 @@ where
                         let viewable = channel_id != 0 && Access::new(&state.lock().unwrap().db, &user)?.allows(channel_id, perm::VIEW_CHANNEL);
                         if viewable {
                             let _ = tx.send(ServerMsg::Typing { channel_id, user: user.clone(), name: display.clone() });
+                        }
+                    }
+
+                    ClientMsg::SetSlowMode { channel: id, seconds } => {
+                        if !may_in_channel(&state, &user, id, perm::MANAGE_CHANNELS)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_CHANNEL_PERMISSION.into() }).await?;
+                            continue;
+                        }
+                        let result = {
+                            let s = state.lock().unwrap();
+                            match s.db.channel_name(id)? {
+                                None => Err("there is no such channel".to_string()),
+                                Some(name) if name.starts_with("dm-") => Err("direct messages can't have slow mode".to_string()),
+                                Some(_) if seconds > common::MAX_SLOW_MODE_SECS => Err(format!(
+                                    "slow mode can be at most {} hours",
+                                    common::MAX_SLOW_MODE_SECS / 3600
+                                )),
+                                Some(_) => {
+                                    s.db.set_slow_mode(id, seconds)?;
+                                    Ok(s.db.slow_modes()?)
+                                }
+                            }
+                        };
+                        match result {
+                            Ok(modes) => {
+                                let _ = tx.send(ServerMsg::SlowModes { modes });
+                            }
+                            Err(text) => send(&mut writer, &ServerMsg::Error { text }).await?,
                         }
                     }
 
@@ -1546,6 +1601,9 @@ where
                     }
                     Ok(overrides @ ServerMsg::CategoryOverrides { .. }) => {
                         send(&mut writer, &overrides).await?;
+                    }
+                    Ok(modes @ ServerMsg::SlowModes { .. }) => {
+                        send(&mut writer, &modes).await?;
                     }
                     Ok(msg @ ServerMsg::MemberRenamed { .. }) => {
                         // This connection's own sends use the new name from now on.
