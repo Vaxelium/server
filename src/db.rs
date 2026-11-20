@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS channels (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL UNIQUE,
     category_id INTEGER,
-    position    INTEGER NOT NULL DEFAULT 0
+    position    INTEGER NOT NULL DEFAULT 0,
+    slow_mode   INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS reactions (
     message_id INTEGER NOT NULL,
@@ -191,6 +192,14 @@ fn add_manage_columns(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Channels gained slow mode after they first existed, so older databases get the column added.
+fn add_slow_mode_column(conn: &Connection) -> rusqlite::Result<()> {
+    if !table_has_column(conn, "channels", "slow_mode")? {
+        conn.execute("ALTER TABLE channels ADD COLUMN slow_mode INTEGER NOT NULL DEFAULT 0", [])?;
+    }
+    Ok(())
+}
+
 /// The four settings in a row, starting at column `at`: view, send, manage channels, manage messages.
 fn setting_from_row(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<common::Setting> {
     let flag = |i: usize| -> rusqlite::Result<Option<bool>> { Ok(row.get::<_, Option<i64>>(i)?.map(|v| v != 0)) };
@@ -251,6 +260,7 @@ impl Db {
         }
         conn.execute_batch(SCHEMA)?;
         add_manage_columns(&conn)?;
+        add_slow_mode_column(&conn)?;
         // The @everyone role: held by every member, always at the bottom of the hierarchy.
         conn.execute(
             "INSERT OR IGNORE INTO roles (id, name, color, permissions, position) VALUES (0, '@everyone', '', 0, -1000000000)",
@@ -1266,6 +1276,40 @@ impl Db {
         }
         tx.commit()?;
         Ok(changed)
+    }
+
+    /// The seconds members must wait between messages in a channel. Zero when it has no slow mode.
+    pub fn slow_mode(&self, channel: i64) -> rusqlite::Result<u64> {
+        let seconds: Option<i64> = {
+            use rusqlite::OptionalExtension;
+            self.conn
+                .query_row("SELECT slow_mode FROM channels WHERE id = ?1", params![channel], |row| row.get(0))
+                .optional()?
+        };
+        Ok(seconds.unwrap_or(0).max(0) as u64)
+    }
+
+    /// Every channel that has slow mode, and how long it is.
+    pub fn slow_modes(&self) -> rusqlite::Result<Vec<common::SlowMode>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, slow_mode FROM channels WHERE slow_mode > 0 ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(common::SlowMode {
+                channel_id: row.get(0)?,
+                seconds: row.get::<_, i64>(1)?.max(0) as u64,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Sets a channel's slow mode. Zero turns it off. Returns false when there is no such channel.
+    pub fn set_slow_mode(&self, channel: i64, seconds: u64) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE channels SET slow_mode = ?2 WHERE id = ?1",
+            params![channel, seconds as i64],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Renames a channel. Returns false when the new name is taken or the channel does not exist.
