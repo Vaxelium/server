@@ -3001,13 +3001,17 @@ fn unread_counts(state: &SharedState, user: &str) -> rusqlite::Result<Vec<common
     let s = state.lock().unwrap();
     let access = Access::new(&s.db, user)?;
     let held_ids = s.db.member_role_ids(user)?;
-    let held: Vec<String> = s
+    // What pings this member: the names of their mentionable roles, and their own name (`@name` mentions them).
+    let mut held: Vec<String> = s
         .db
         .role_list()?
         .into_iter()
         .filter(|r| r.mentionable && r.id != common::EVERYONE_ROLE && held_ids.contains(&r.id))
         .map(|r| r.name)
         .collect();
+    if let Some(own) = s.db.display_names()?.get(user) {
+        held.push(own.clone());
+    }
     let mut counts = Vec::new();
     for (channel_id, name) in s.db.channel_names()? {
         if name.starts_with("dm-") || !access.allows(channel_id, perm::VIEW_CHANNEL) {
