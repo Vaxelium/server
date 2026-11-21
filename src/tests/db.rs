@@ -940,3 +940,54 @@ mod slow_mode_tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+mod timeout_tests {
+    use super::super::*;
+    use crate::timeout_notice;
+
+    #[test]
+    fn a_timeout_lasts_until_its_end_and_then_expires() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("bob", "Bob", 2).unwrap();
+        assert!(db.active_timeout("bob", 100).unwrap().is_none());
+        db.set_timeout("bob", "owner", "spam", 500).unwrap();
+        assert_eq!(db.active_timeout("bob", 499).unwrap(), Some((500, "spam".to_string())));
+        assert!(db.active_timeout("bob", 500).unwrap().is_none(), "the timeout ends at its end time");
+        assert!(db.end_timeout_at("bob", 500).unwrap(), "the timer ending it removes it");
+        assert!(db.active_timeout("bob", 100).unwrap().is_none());
+    }
+
+    #[test]
+    fn ending_a_timeout_only_happens_for_the_timeout_it_was_set_for() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("bob", "Bob", 2).unwrap();
+        db.set_timeout("bob", "owner", "first", 500).unwrap();
+        db.set_timeout("bob", "owner", "second", 900).unwrap();
+        assert!(!db.end_timeout_at("bob", 500).unwrap(), "the first timer does nothing once replaced");
+        assert_eq!(db.active_timeout("bob", 0).unwrap(), Some((900, "second".to_string())));
+        assert!(db.clear_timeout("bob").unwrap());
+        assert!(!db.end_timeout_at("bob", 900).unwrap(), "a lifted timeout is not ended twice");
+    }
+
+    #[test]
+    fn a_second_timeout_replaces_the_first_and_can_be_ended_early() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("bob", "Bob", 2).unwrap();
+        db.set_timeout("bob", "owner", "first", 500).unwrap();
+        db.set_timeout("bob", "owner", "second", 900).unwrap();
+        assert_eq!(db.active_timeout("bob", 0).unwrap(), Some((900, "second".to_string())));
+        assert!(db.clear_timeout("bob").unwrap());
+        assert!(db.active_timeout("bob", 0).unwrap().is_none());
+        assert!(!db.clear_timeout("bob").unwrap(), "clearing twice reports there was none");
+    }
+
+    #[test]
+    fn timeout_notice_rounds_the_time_left_up_to_minutes() {
+        assert_eq!(timeout_notice(130, 0), "you are timed out from sending messages for 3 more minutes");
+        assert_eq!(timeout_notice(60, 0), "you are timed out from sending messages for 1 more minute");
+        assert_eq!(timeout_notice(5, 0), "you are timed out from sending messages for 1 more minute");
+    }
+}

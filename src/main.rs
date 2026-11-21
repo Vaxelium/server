@@ -476,6 +476,12 @@ where
     send(&mut writer, &ServerMsg::ChannelOverrides { overrides }).await?;
     let modes = state.lock().unwrap().db.slow_modes()?;
     send(&mut writer, &ServerMsg::SlowModes { modes }).await?;
+    // A member who is still timed out is told, so the client can show it from the start.
+    let timed_out = state.lock().unwrap().db.active_timeout(&user, now_secs())?;
+    if let Some((until, reason)) = timed_out {
+        send(&mut writer, &ServerMsg::TimedOut { user: user.clone(), until, reason }).await?;
+        arm_timeout_end(&state, &tx, &user, until);
+    }
     let overrides = state.lock().unwrap().db.category_overrides()?;
     send(&mut writer, &ServerMsg::CategoryOverrides { overrides }).await?;
     let (channels, categories) = {
@@ -980,6 +986,12 @@ where
                             send(&mut writer, &ServerMsg::Error { text: CANNOT_SEND.into() }).await?;
                             continue;
                         }
+                        let now = now_secs();
+                        let timed_out = state.lock().unwrap().db.active_timeout(&user, now)?;
+                        if let Some((until, _)) = timed_out {
+                            send(&mut writer, &ServerMsg::Error { text: timeout_notice(until, now) }).await?;
+                            continue;
+                        }
                         let text = text.trim().to_string();
                         if text.is_empty() {
                             continue;
@@ -1360,6 +1372,24 @@ where
                         state.lock().unwrap().db.unban(&member)?;
                     }
 
+                    ClientMsg::Timeout { user: member, seconds, reason } => {
+                        if let Err(text) = timeout_member(&state, &tx, &user, &member, seconds, &clean_reason(reason))? {
+                            send(&mut writer, &ServerMsg::Error { text }).await?;
+                        }
+                    }
+
+                    ClientMsg::RemoveTimeout { user: member } => {
+                        if !may(&state, &user, perm::TIMEOUT_MEMBERS)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_TIMEOUT_PERMISSION.into() }).await?;
+                            continue;
+                        }
+                        if state.lock().unwrap().db.clear_timeout(&member)? {
+                            let _ = tx.send(ServerMsg::TimeoutEnded { user: member });
+                        } else {
+                            send(&mut writer, &ServerMsg::Error { text: "that member is not timed out".into() }).await?;
+                        }
+                    }
+
                     ClientMsg::GetBans => {
                         if !may(&state, &user, perm::BAN_MEMBERS)? {
                             send(&mut writer, &ServerMsg::Error { text: NO_BAN_PERMISSION.into() }).await?;
@@ -1624,6 +1654,10 @@ where
                     }
                     Ok(status @ ServerMsg::ProfileStatus { .. }) => {
                         send(&mut writer, &status).await?;
+                    }
+                    // Timeouts starting and ending are pushed to everyone, so the member timed out sees it at once.
+                    Ok(timeout @ (ServerMsg::TimedOut { .. } | ServerMsg::TimeoutEnded { .. })) => {
+                        send(&mut writer, &timeout).await?;
                     }
                     Ok(roles @ ServerMsg::Roles { .. }) => {
                         send(&mut writer, &roles).await?;
@@ -2932,6 +2966,69 @@ fn normalize_channel(name: &str) -> String {
 const MAX_REMOVAL_REASON_LEN: usize = 200;
 const NO_BAN_PERMISSION: &str = "you need the Ban Members permission for that";
 const NO_KICK_PERMISSION: &str = "you need the Kick Members permission for that";
+const NO_TIMEOUT_PERMISSION: &str = "you need the Timeout Members permission for that";
+
+/// The message a timed-out member sees when they try to send, with the time left rounded up to whole minutes.
+fn timeout_notice(until: u64, now: u64) -> String {
+    let minutes = until.saturating_sub(now).div_ceil(60).max(1);
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    format!("you are timed out from sending messages for {minutes} more {unit}")
+}
+
+/// Times a member out from sending messages for `seconds`. The actor needs Timeout Members, the member's highest
+/// role must be below theirs, and the owner cannot be timed out. Everyone is told.
+fn timeout_member(
+    state: &SharedState,
+    tx: &broadcast::Sender<ServerMsg>,
+    actor: &str,
+    member: &str,
+    seconds: u64,
+    reason: &str,
+) -> rusqlite::Result<Result<(), String>> {
+    let s = state.lock().unwrap();
+    let order = s.db.role_list()?;
+    let power = power_of(&s.db, actor, &order)?;
+    if !power.has(perm::TIMEOUT_MEMBERS) {
+        return Ok(Err(NO_TIMEOUT_PERMISSION.into()));
+    }
+    if member == actor {
+        return Ok(Err("you cannot time yourself out".into()));
+    }
+    if seconds == 0 || seconds > common::MAX_MEMBER_TIMEOUT_SECS {
+        return Ok(Err(format!("a timeout must be between 1 second and {} days", common::MAX_MEMBER_TIMEOUT_SECS / 86_400)));
+    }
+    if !s.db.is_member(member)? {
+        return Ok(Err("that person is not a member of this server".into()));
+    }
+    let target = power_of(&s.db, member, &order)?;
+    if target.owner {
+        return Ok(Err("the owner cannot be timed out".into()));
+    }
+    if !target.top.map_or(true, |top| power.outranks(top)) {
+        return Ok(Err("that member's highest role is not below yours".into()));
+    }
+    let until = now_secs() + seconds;
+    s.db.set_timeout(member, actor, reason, until)?;
+    drop(s);
+    let _ = tx.send(ServerMsg::TimedOut { user: member.to_string(), until, reason: reason.to_string() });
+    arm_timeout_end(state, tx, member, until);
+    Ok(Ok(()))
+}
+
+/// Tells everyone the moment a member's timeout ends. Does nothing if it was lifted or replaced in the meantime.
+fn arm_timeout_end(state: &SharedState, tx: &broadcast::Sender<ServerMsg>, member: &str, until: u64) {
+    let state = state.clone();
+    let tx = tx.clone();
+    let member = member.to_string();
+    let wait = Duration::from_secs(until.saturating_sub(now_secs()));
+    tokio::spawn(async move {
+        tokio::time::sleep(wait).await;
+        let ended = state.lock().unwrap().db.end_timeout_at(&member, until).unwrap_or(false);
+        if ended {
+            let _ = tx.send(ServerMsg::TimeoutEnded { user: member });
+        }
+    });
+}
 
 /// A reason as typed: trimmed, and kept to a sensible length. Empty when none was given.
 fn clean_reason(reason: Option<String>) -> String {

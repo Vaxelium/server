@@ -22,6 +22,12 @@ CREATE TABLE IF NOT EXISTS bans (
     by_id TEXT NOT NULL DEFAULT '',
     at INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS timeouts (
+    user_id TEXT PRIMARY KEY,
+    until   INTEGER NOT NULL,
+    reason  TEXT NOT NULL DEFAULT '',
+    by_id   TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS members (
     name       TEXT PRIMARY KEY,
     first_seen INTEGER NOT NULL
@@ -627,6 +633,43 @@ impl Db {
     /// Lets a banned account join again.
     pub fn unban(&self, id: &str) -> rusqlite::Result<()> {
         self.conn.execute("DELETE FROM bans WHERE user_id = ?1", params![id]).map(|_| ())
+    }
+
+    /// Times an account out from sending messages until `until` (Unix seconds), with the reason (empty for none)
+    /// and the member who did it. A later timeout replaces an earlier one.
+    pub fn set_timeout(&self, id: &str, by: &str, reason: &str, until: u64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO timeouts (user_id, until, reason, by_id) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (user_id) DO UPDATE SET until = excluded.until, reason = excluded.reason, by_id = excluded.by_id",
+            params![id, until as i64, reason, by],
+        )?;
+        Ok(())
+    }
+
+    /// Ends an account's timeout. Returns false when it had none.
+    pub fn clear_timeout(&self, id: &str) -> rusqlite::Result<bool> {
+        Ok(self.conn.execute("DELETE FROM timeouts WHERE user_id = ?1", params![id])? > 0)
+    }
+
+    /// The account's timeout, as (until, reason), if it is still in force at `now`. An expired row is left for
+    /// the timer that ends it (see `end_timeout_at`), so the members are told.
+    pub fn active_timeout(&self, id: &str, now: u64) -> rusqlite::Result<Option<(u64, String)>> {
+        let row: Option<(i64, String)> = self
+            .conn
+            .query_row("SELECT until, reason FROM timeouts WHERE user_id = ?1", params![id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?;
+        Ok(row.filter(|(until, _)| *until as u64 > now).map(|(until, reason)| (until as u64, reason)))
+    }
+
+    /// Ends the account's timeout if it is still the one ending at `until`. Returns false when it was lifted
+    /// or replaced since, so the timer that asked does nothing.
+    pub fn end_timeout_at(&self, id: &str, until: u64) -> rusqlite::Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM timeouts WHERE user_id = ?1 AND until = ?2", params![id, until as i64])?
+            > 0)
     }
 
     /// Whether this account is banned from the server.
