@@ -476,6 +476,8 @@ where
     send(&mut writer, &ServerMsg::ChannelOverrides { overrides }).await?;
     let modes = state.lock().unwrap().db.slow_modes()?;
     send(&mut writer, &ServerMsg::SlowModes { modes }).await?;
+    let counts = unread_counts(&state, &user)?;
+    send(&mut writer, &ServerMsg::Unread { counts }).await?;
     // A member who is still timed out is told, so the client can show it from the start.
     let timed_out = state.lock().unwrap().db.active_timeout(&user, now_secs())?;
     if let Some((until, reason)) = timed_out {
@@ -952,6 +954,8 @@ where
                             Some((id, history)) => {
                                 channel = name.clone();
                                 channel_id = id;
+                                // Opening a channel reads it.
+                                state.lock().unwrap().db.mark_read(&user, id)?;
                                 send(&mut writer, &ServerMsg::Joined { channel: ChannelRef { id, name }, history }).await?;
                             }
                             None => {
@@ -1001,6 +1005,11 @@ where
                                 text: format!("message longer than {MAX_TEXT_LEN} characters"),
                             })
                             .await?;
+                            continue;
+                        }
+                        // @everyone and @here notify the whole channel, so they need the Mention Everyone permission.
+                        if common::everyone_mentioned(&text) && !may_in_channel(&state, &user, channel_id, perm::MENTION_EVERYONE)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_EVERYONE_PERMISSION.into() }).await?;
                             continue;
                         }
                         // Slow mode: each member waits this long after their last message in the channel. Members
@@ -1378,6 +1387,10 @@ where
                         }
                     }
 
+                    ClientMsg::MarkRead { channel_id: read } => {
+                        state.lock().unwrap().db.mark_read(&user, read)?;
+                    }
+
                     ClientMsg::RemoveTimeout { user: member } => {
                         if !may(&state, &user, perm::TIMEOUT_MEMBERS)? {
                             send(&mut writer, &ServerMsg::Error { text: NO_TIMEOUT_PERMISSION.into() }).await?;
@@ -1527,6 +1540,13 @@ where
                             continue;
                         }
                         let text = text.trim().to_string();
+                        if common::everyone_mentioned(&text) {
+                            let channel = state.lock().unwrap().db.message_channel_id(id)?.unwrap_or(0);
+                            if !may_in_channel(&state, &user, channel, perm::MENTION_EVERYONE)? {
+                                send(&mut writer, &ServerMsg::Error { text: NO_EVERYONE_PERMISSION.into() }).await?;
+                                continue;
+                            }
+                        }
                         if text.is_empty() {
                             continue;
                         }
@@ -1581,11 +1601,13 @@ where
                             let viewable = Access::new(&state.lock().unwrap().db, &user)?.allows(channel_id, perm::VIEW_CHANNEL);
                             if viewable {
                                 send(&mut writer, &ServerMsg::Message { message }).await?;
+                                // A message shown while the channel is open has been read.
+                                state.lock().unwrap().db.mark_read(&user, channel_id)?;
                             }
                         } else {
-                            // Tell the client there is unread activity, without the content. A
-                            // direct message is announced only to its members, and a channel only
-                            // to members who may view it.
+                            // Tell the client there is new activity, with the message. A direct
+                            // message is announced only to its members, and a channel only to members
+                            // who may view it.
                             let allowed = {
                                 let s = state.lock().unwrap();
                                 let access = Access::new(&s.db, &user)?;
@@ -1594,7 +1616,7 @@ where
                                         || s.db.is_dm_member(&message.channel, &user)?)
                             };
                             if allowed {
-                                send(&mut writer, &ServerMsg::Activity { channel_id: message.channel_id }).await?;
+                                send(&mut writer, &ServerMsg::Activity { message }).await?;
                             }
                         }
                     }
@@ -2967,6 +2989,44 @@ const MAX_REMOVAL_REASON_LEN: usize = 200;
 const NO_BAN_PERMISSION: &str = "you need the Ban Members permission for that";
 const NO_KICK_PERMISSION: &str = "you need the Kick Members permission for that";
 const NO_TIMEOUT_PERMISSION: &str = "you need the Timeout Members permission for that";
+const NO_EVERYONE_PERMISSION: &str = "you need the Mention Everyone permission to use @everyone or @here";
+
+/// The most messages in a channel that are counted as unread, so a long-unopened channel is not scanned forever.
+const UNREAD_SCAN: i64 = 500;
+
+/// What a member has not read in each channel they may view: the messages since they last read it, and how many
+/// of those ping them (`@everyone`, `@here`, or a mentionable role they hold).
+fn unread_counts(state: &SharedState, user: &str) -> rusqlite::Result<Vec<common::UnreadCount>> {
+    let s = state.lock().unwrap();
+    let access = Access::new(&s.db, user)?;
+    let held_ids = s.db.member_role_ids(user)?;
+    let held: Vec<String> = s
+        .db
+        .role_list()?
+        .into_iter()
+        .filter(|r| r.mentionable && r.id != common::EVERYONE_ROLE && held_ids.contains(&r.id))
+        .map(|r| r.name)
+        .collect();
+    let mut counts = Vec::new();
+    for (channel_id, name) in s.db.channel_names()? {
+        if name.starts_with("dm-") || !access.allows(channel_id, perm::VIEW_CHANNEL) {
+            continue;
+        }
+        let Some(rows) = s.db.unread_messages(user, channel_id, UNREAD_SCAN)? else {
+            continue;
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        let mentions = rows.iter().filter(|(_, text)| common::pings_viewer(text, &held)).count();
+        counts.push(common::UnreadCount {
+            channel_id,
+            unread: rows.len() as u32,
+            mentions: mentions as u32,
+        });
+    }
+    Ok(counts)
+}
 
 /// The message a timed-out member sees when they try to send, with the time left rounded up to whole minutes.
 fn timeout_notice(until: u64, now: u64) -> String {

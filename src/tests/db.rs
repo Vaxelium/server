@@ -21,6 +21,23 @@ mod tests {
     }
 
     #[test]
+    fn a_channel_counts_what_a_member_has_not_read_since_they_last_read_it() {
+        let db = Db::open(":memory:").unwrap();
+        let general = db.ensure_channel("general").unwrap();
+        db.save_message(&message(&db, "general", "bob", "hi")).unwrap();
+        assert!(db.unread_messages("alice", general, 500).unwrap().is_none(), "never read: nothing counted yet");
+
+        db.mark_read("alice", general).unwrap();
+        db.save_message(&message(&db, "general", "bob", "hey")).unwrap();
+        db.save_message(&message(&db, "general", "alice", "my own")).unwrap();
+        let rows = db.unread_messages("alice", general, 500).unwrap().unwrap();
+        assert_eq!(rows, vec![("bob".to_string(), "hey".to_string())], "the viewer's own messages are not unread");
+
+        db.mark_read("alice", general).unwrap();
+        assert!(db.unread_messages("alice", general, 500).unwrap().unwrap().is_empty());
+    }
+
+    #[test]
     fn a_renamed_member_shows_the_new_name_to_everyone() {
         let db = Db::open(":memory:").unwrap();
         db.add_member("acct-1", "Old name", 1).unwrap();
