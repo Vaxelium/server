@@ -2560,8 +2560,9 @@ fn mention_refusal(
     text: &str,
     now: u64,
 ) -> rusqlite::Result<Option<Refusal>> {
-    // Members who may manage the server, and members with an allowed role, are left alone.
-    if may(state, user, perm::MANAGE_SERVER)? {
+    // Members who may manage the server, members who may mention past the limit, and members with an allowed
+    // role, are left alone.
+    if may(state, user, perm::MANAGE_SERVER)? || may(state, user, perm::BYPASS_MENTION_LIMIT)? {
         return Ok(None);
     }
     let held = state.lock().unwrap().db.member_role_ids(user)?;
