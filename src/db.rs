@@ -28,6 +28,12 @@ CREATE TABLE IF NOT EXISTS timeouts (
     reason  TEXT NOT NULL DEFAULT '',
     by_id   TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS read_marks (
+    user_id    TEXT NOT NULL,
+    channel_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    PRIMARY KEY (user_id, channel_id)
+);
 CREATE TABLE IF NOT EXISTS members (
     name       TEXT PRIMARY KEY,
     first_seen INTEGER NOT NULL
@@ -670,6 +676,42 @@ impl Db {
             .conn
             .execute("DELETE FROM timeouts WHERE user_id = ?1 AND until = ?2", params![id, until as i64])?
             > 0)
+    }
+
+    /// Marks a channel read up to its newest message, for this account.
+    pub fn mark_read(&self, user: &str, channel_id: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO read_marks (user_id, channel_id, message_id)
+             VALUES (?1, ?2, COALESCE((SELECT MAX(id) FROM messages WHERE channel_id = ?2), 0))
+             ON CONFLICT (user_id, channel_id) DO UPDATE SET message_id = excluded.message_id",
+            params![user, channel_id],
+        )?;
+        Ok(())
+    }
+
+    /// The messages in a channel since this account last read it, newest first, up to `limit`, as (author id,
+    /// text). None when the account has never read the channel, so nothing in it is counted yet. Its own messages
+    /// are left out.
+    pub fn unread_messages(&self, user: &str, channel_id: i64, limit: i64) -> rusqlite::Result<Option<Vec<(String, String)>>> {
+        let mark: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT message_id FROM read_marks WHERE user_id = ?1 AND channel_id = ?2",
+                params![user, channel_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(mark) = mark else {
+            return Ok(None);
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT author, text FROM messages WHERE channel_id = ?1 AND id > ?2 AND author != ?3
+             ORDER BY id DESC LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(params![channel_id, mark, user, limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+        Ok(Some(rows))
     }
 
     /// Whether this account is banned from the server.
