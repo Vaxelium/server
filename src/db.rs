@@ -689,6 +689,13 @@ impl Db {
         Ok(())
     }
 
+    /// The accounts that have read a channel, so a new message in it counts toward their mentions.
+    pub fn readers_of(&self, channel_id: i64) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT user_id FROM read_marks WHERE channel_id = ?1")?;
+        let rows = stmt.query_map(params![channel_id], |row| row.get(0))?;
+        rows.collect()
+    }
+
     /// The messages in a channel since this account last read it, newest first, up to `limit`, as (author id,
     /// text). None when the account has never read the channel, so nothing in it is counted yet. Its own messages
     /// are left out.
