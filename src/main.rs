@@ -955,7 +955,7 @@ where
                                 channel = name.clone();
                                 channel_id = id;
                                 // Opening a channel reads it.
-                                state.lock().unwrap().db.mark_read(&user, id)?;
+                                read_channel(&state, &auth_addr, &user, id)?;
                                 send(&mut writer, &ServerMsg::Joined { channel: ChannelRef { id, name }, history }).await?;
                             }
                             None => {
@@ -1070,6 +1070,9 @@ where
                             message.reply = state.lock().unwrap().db.reply_ref(id, channel_id)?;
                         }
                         message.id = state.lock().unwrap().db.save_message(&message)?;
+                        // Everyone who has read this channel may have a new mention.
+                        let readers = state.lock().unwrap().db.readers_of(channel_id)?;
+                        report_mentions(&state, &auth_addr, readers);
                         if slow > 0 {
                             state.lock().unwrap().slow_last.insert((channel_id, user.clone()), now_secs());
                         }
@@ -1388,7 +1391,7 @@ where
                     }
 
                     ClientMsg::MarkRead { channel_id: read } => {
-                        state.lock().unwrap().db.mark_read(&user, read)?;
+                        read_channel(&state, &auth_addr, &user, read)?;
                     }
 
                     ClientMsg::RemoveTimeout { user: member } => {
@@ -1602,7 +1605,7 @@ where
                             if viewable {
                                 send(&mut writer, &ServerMsg::Message { message }).await?;
                                 // A message shown while the channel is open has been read.
-                                state.lock().unwrap().db.mark_read(&user, channel_id)?;
+                                read_channel(&state, &auth_addr, &user, channel_id)?;
                             }
                         } else {
                             // Tell the client there is new activity, with the message. A direct
@@ -1829,6 +1832,78 @@ fn pin_ok(state: &SharedState, kind: &str, addr: &str, fingerprint: &str) -> boo
 /// remembered, the same way `verify_session` does.
 async fn auth_call(state: &SharedState, auth_addr: &str, request: &AuthRequest) -> Result<AuthReply, String> {
     let (mut stream, fingerprint) = common::tls::connect_async(auth_addr)
+        .await
+        .map_err(|e| format!("auth service unavailable: {e}"))?;
+    if !pin_ok(state, "auth", auth_addr, &fingerprint) {
+        return Err("the auth service's certificate has changed".into());
+    }
+    let mut line = serde_json::to_string(request).map_err(|e| e.to_string())?;
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| format!("auth service unavailable: {e}"))?;
+    let mut lines = BufReader::new(stream).lines();
+    let reply = lines
+        .next_line()
+        .await
+        .map_err(|e| format!("auth service unavailable: {e}"))?
+        .ok_or_else(|| "auth service closed the connection".to_string())?;
+    serde_json::from_str(&reply).map_err(|e| format!("bad reply from auth service: {e}"))
+}
+
+/// Marks a channel read for this member, and reports their mention totals, which the reading changed.
+fn read_channel(state: &SharedState, auth_addr: &Arc<String>, user: &str, channel_id: i64) -> rusqlite::Result<()> {
+    state.lock().unwrap().db.mark_read(user, channel_id)?;
+    report_mentions(state, auth_addr, vec![user.to_string()]);
+    Ok(())
+}
+
+/// Reports these members' mention totals on this server to the auth service, in the background. A total is
+/// counted across the server's channels, so the server's icon can show it while the member is elsewhere.
+fn report_mentions(state: &SharedState, auth_addr: &Arc<String>, accounts: Vec<String>) {
+    if accounts.is_empty() {
+        return;
+    }
+    let mut totals = Vec::new();
+    for account in accounts {
+        if let Ok(counts) = unread_counts(state, &account) {
+            let total: u32 = counts.iter().map(|c| c.mentions).sum();
+            totals.push(common::MentionTotal { account, total });
+        }
+    }
+    let (server_id, cert, key) = {
+        let s = state.lock().unwrap();
+        let server_id = s.db.info_value("server_id").ok().flatten().unwrap_or_default();
+        let cert = s.db.info_value("tls_cert").ok().flatten();
+        let key = s.db.info_value("tls_key").ok().flatten();
+        (server_id, cert, key)
+    };
+    let (Some(cert), Some(key)) = (cert, key) else {
+        return;
+    };
+    let state = state.clone();
+    let auth_addr = auth_addr.clone();
+    tokio::spawn(async move {
+        let request = AuthRequest::ReportMentions { server_id, totals };
+        match auth_report(&state, &auth_addr, &cert, &key, &request).await {
+            Ok(AuthReply::MentionsRecorded) => {}
+            Ok(AuthReply::Error { text }) => eprintln!("auth service refused mention totals: {text}"),
+            Ok(_) => eprintln!("auth service sent an unexpected reply to mention totals"),
+            Err(e) => eprintln!("could not report mention totals: {e}"),
+        }
+    });
+}
+
+/// Sends a request to the auth service with this server's certificate, so it knows which server is reporting.
+async fn auth_report(
+    state: &SharedState,
+    auth_addr: &str,
+    cert: &str,
+    key: &str,
+    request: &AuthRequest,
+) -> Result<AuthReply, String> {
+    let (mut stream, fingerprint) = common::tls::connect_async_with_identity(auth_addr, cert, key)
         .await
         .map_err(|e| format!("auth service unavailable: {e}"))?;
     if !pin_ok(state, "auth", auth_addr, &fingerprint) {
