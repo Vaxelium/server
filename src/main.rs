@@ -1265,9 +1265,12 @@ where
                         }
                         let allowed = {
                             let s = state.lock().unwrap();
-                            match s.db.message_channel(id)? {
-                                Some(c) if c.starts_with("dm-") => s.db.is_dm_member(&c, &user)?,
-                                _ => true,
+                            match s.db.message_channel_id(id)? {
+                                Some(channel) => match s.db.channel_name(channel)? {
+                                    Some(name) if name.starts_with("dm-") => s.db.is_dm_member(&name, &user)?,
+                                    _ => true,
+                                },
+                                None => true,
                             }
                         };
                         if !allowed {
@@ -1485,8 +1488,12 @@ where
                         // (or Manage messages).
                         let (channel, in_dm) = {
                             let s = state.lock().unwrap();
-                            let name = s.db.message_channel(id)?.unwrap_or_default();
-                            (s.db.message_channel_id(id)?, name.starts_with("dm-"))
+                            let channel = s.db.message_channel_id(id)?;
+                            let name = match channel {
+                                Some(c) => s.db.channel_name(c)?.unwrap_or_default(),
+                                None => String::new(),
+                            };
+                            (channel, name.starts_with("dm-"))
                         };
                         let Some(channel) = channel else { continue };
                         let may_pin = in_dm
@@ -2335,14 +2342,16 @@ fn visible_layout(
 
 /// Whether `user` may view the channel a message is in. False when the message does not exist.
 fn message_visible(state: &SharedState, user: &str, id: i64) -> rusqlite::Result<bool> {
-    let s = state.lock().unwrap();
-    let Some(name) = s.db.message_channel(id)? else {
+    message_visible_in(&state.lock().unwrap().db, user, id)
+}
+
+/// `message_visible` on the database. A message is found by its channel's id: a channel's name can change, and
+/// its messages keep the id.
+fn message_visible_in(db: &Db, user: &str, id: i64) -> rusqlite::Result<bool> {
+    let Some(channel_id) = db.message_channel_id(id)? else {
         return Ok(false);
     };
-    let Some(channel_id) = s.db.channel_id(&name)? else {
-        return Ok(false);
-    };
-    Ok(Access::new(&s.db, user)?.allows(channel_id, perm::VIEW_CHANNEL))
+    Ok(Access::new(db, user)?.allows(channel_id, perm::VIEW_CHANNEL))
 }
 
 /// The listed word `display` matches under AutoMod's name rule, or None when the name is fine or the

@@ -1008,3 +1008,36 @@ mod timeout_tests {
         assert_eq!(timeout_notice(5, 0), "you are timed out from sending messages for 1 more minute");
     }
 }
+
+#[cfg(test)]
+mod message_visibility_tests {
+    use crate::*;
+
+    /// A message whose channel was renamed can still be reacted to, edited and deleted: the message keeps its
+    /// channel's id, not its name.
+    #[test]
+    fn a_renamed_channels_messages_stay_visible_to_their_members() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("bob", "Bob", 1).unwrap();
+        let general = db.ensure_channel("general").unwrap();
+        let m = ChatMessage {
+            id: 0,
+            channel_id: general,
+            channel: "general".into(),
+            author: "bob".into(),
+            author_id: "bob".into(),
+            text: "hi".into(),
+            timestamp: 1,
+            edited: false,
+            reactions: Vec::new(),
+            reply: None,
+            pinned: false,
+            report: None,
+            image: None,
+        };
+        let id = db.save_message(&m).unwrap();
+        assert!(db.rename_channel(general, "lobby").unwrap());
+        assert!(message_visible_in(&db, "bob", id).unwrap(), "the renamed channel's message is still visible");
+        assert!(!message_visible_in(&db, "bob", id + 1000).unwrap(), "a message that does not exist is not visible");
+    }
+}
