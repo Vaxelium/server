@@ -1040,4 +1040,15 @@ mod message_visibility_tests {
         assert!(message_visible_in(&db, "bob", id).unwrap(), "the renamed channel's message is still visible");
         assert!(!message_visible_in(&db, "bob", id + 1000).unwrap(), "a message that does not exist is not visible");
     }
+
+    /// A channel that is not a direct message is open to any member; a direct message is only open to its members.
+    #[test]
+    fn only_direct_message_members_may_use_a_direct_message_channel() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("bob", "Bob", 1).unwrap();
+        let general = db.ensure_channel("general").unwrap();
+        let dm = db.ensure_channel("dm-999").unwrap();
+        assert!(db.dm_channel_allows(general, "bob").unwrap());
+        assert!(!db.dm_channel_allows(dm, "bob").unwrap(), "bob is not in that direct message");
+    }
 }

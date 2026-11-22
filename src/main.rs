@@ -1266,10 +1266,7 @@ where
                         let allowed = {
                             let s = state.lock().unwrap();
                             match s.db.message_channel_id(id)? {
-                                Some(channel) => match s.db.channel_name(channel)? {
-                                    Some(name) if name.starts_with("dm-") => s.db.is_dm_member(&name, &user)?,
-                                    _ => true,
-                                },
+                                Some(channel) => s.db.dm_channel_allows(channel, &user)?,
                                 None => true,
                             }
                         };
@@ -1624,8 +1621,7 @@ where
                                 let s = state.lock().unwrap();
                                 let access = Access::new(&s.db, &user)?;
                                 access.allows(message.channel_id, perm::VIEW_CHANNEL)
-                                    && (!message.channel.starts_with("dm-")
-                                        || s.db.is_dm_member(&message.channel, &user)?)
+                                    && s.db.dm_channel_allows(message.channel_id, &user)?
                             };
                             if allowed {
                                 send(&mut writer, &ServerMsg::Activity { message }).await?;
