@@ -1071,5 +1071,36 @@ mod custom_emoji_tests {
         assert!(!db.delete_emoji(party).unwrap(), "already removed");
         assert_eq!(db.emoji_count().unwrap(), 0);
     }
+
+    #[test]
+    fn renaming_an_emoji_moves_its_reactions_to_the_new_name() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("bob", "Bob", 1).unwrap();
+        let general = db.ensure_channel("general").unwrap();
+        let party = db.add_emoji("party", b"png-bytes").unwrap().expect("added");
+        let m = ChatMessage {
+            id: 0,
+            channel_id: general,
+            channel: "general".into(),
+            author: "bob".into(),
+            author_id: "bob".into(),
+            text: "hi".into(),
+            timestamp: 1,
+            edited: false,
+            reactions: Vec::new(),
+            reply: None,
+            pinned: false,
+            report: None,
+            image: None,
+        };
+        let message = db.save_message(&m).unwrap();
+        db.toggle_reaction(message, ":party:", "bob").unwrap();
+        assert!(db.rename_emoji(party, "celebrate").unwrap());
+        assert!(!db.rename_emoji(999, "other").unwrap(), "no such emoji");
+        let (_, after) = db.toggle_reaction(message, ":celebrate:", "carol").unwrap().expect("the message exists");
+        let shown = after.iter().find(|r| r.emoji == ":celebrate:").expect("the reaction kept under the new name");
+        assert_eq!(shown.users.len(), 2, "bob's reaction moved and carol's joined it");
+        assert!(after.iter().all(|r| r.emoji != ":party:"));
+    }
 }
 

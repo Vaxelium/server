@@ -1716,6 +1716,26 @@ impl Db {
         Ok(count > 0)
     }
 
+    /// Renames a custom emoji, and moves the reactions that used its old name to the new one. False when there is
+    /// no emoji with this id.
+    pub fn rename_emoji(&self, id: i64, name: &str) -> rusqlite::Result<bool> {
+        use rusqlite::OptionalExtension;
+        let old: Option<String> = self
+            .conn
+            .query_row("SELECT name FROM custom_emoji WHERE id = ?1", params![id], |row| row.get(0))
+            .optional()?;
+        let Some(old) = old else {
+            return Ok(false);
+        };
+        self.conn
+            .execute("UPDATE custom_emoji SET name = ?2 WHERE id = ?1", params![id, name])?;
+        self.conn.execute(
+            "UPDATE reactions SET emoji = ?2 WHERE emoji = ?1",
+            params![format!(":{old}:"), format!(":{name}:")],
+        )?;
+        Ok(true)
+    }
+
     /// Removes a custom emoji. False when there is none with this id.
     pub fn delete_emoji(&self, id: i64) -> rusqlite::Result<bool> {
         Ok(self.conn.execute("DELETE FROM custom_emoji WHERE id = ?1", params![id])? > 0)
