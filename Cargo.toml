@@ -16,3 +16,4 @@ base64 = "0.22"
 skrifa = "0.49"
 tiny-skia = "0.12"
 unicode-normalization = "0.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
