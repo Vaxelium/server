@@ -832,6 +832,12 @@ where
                         }
                     }
 
+                    ClientMsg::RenameEmoji { emoji, name } => {
+                        if let Some(text) = change_emoji(&state, &tx, &user, EmojiChange::Rename { emoji, name })? {
+                            send(&mut writer, &ServerMsg::Error { text }).await?;
+                        }
+                    }
+
                     ClientMsg::CreateBadge { name, color } => {
                         if let Some(text) = change_badges(&state, &tx, &user, BadgeChange::Create { name, color })? {
                             send(&mut writer, &ServerMsg::Error { text }).await?;
@@ -1718,6 +1724,13 @@ where
                     }
                     Ok(icon @ ServerMsg::ServerIcon { .. }) => {
                         send(&mut writer, &icon).await?;
+                    }
+                    // The server's emoji and badge lists change while a member is connected, so every change is sent on.
+                    Ok(list @ ServerMsg::CustomEmoji { .. }) => {
+                        send(&mut writer, &list).await?;
+                    }
+                    Ok(list @ ServerMsg::Badges { .. }) => {
+                        send(&mut writer, &list).await?;
                     }
                     Ok(updated @ ServerMsg::ServerUpdated { .. }) => {
                         send(&mut writer, &updated).await?;
@@ -2973,6 +2986,7 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
 enum EmojiChange {
     Add { name: String, image: String },
     Remove { emoji: i64 },
+    Rename { emoji: i64, name: String },
 }
 
 /// The most custom emoji one server can have.
@@ -3033,6 +3047,23 @@ fn change_emoji(
             true => None,
             false => Some("there is no such emoji".to_string()),
         },
+        EmojiChange::Rename { emoji, name } => {
+            let name = name.trim().to_lowercase();
+            if !valid_emoji_name(&name) {
+                Some("an emoji needs a name of 2 to 32 letters, digits or underscores".to_string())
+            } else {
+                let s = state.lock().unwrap();
+                if s.db.emoji_named(&name)? {
+                    // Keeping the name it already has is not a change, so it is not refused.
+                    let own = s.db.emoji_rows()?.into_iter().any(|(id, n, _)| id == emoji && n == name);
+                    if own { None } else { Some("an emoji with that name already exists".to_string()) }
+                } else if s.db.rename_emoji(emoji, &name)? {
+                    None
+                } else {
+                    Some("there is no such emoji".to_string())
+                }
+            }
+        }
     };
     if refused.is_none() {
         let _ = tx.send(ServerMsg::CustomEmoji { emoji: emoji_list(state)? });
