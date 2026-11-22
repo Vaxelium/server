@@ -964,7 +964,9 @@ where
                         }
                     }
 
-                    ClientMsg::Say { text, reply_to } => {
+                    ClientMsg::Say { text, reply_to, channel: target } => {
+                        // A forwarded message goes to the channel it names, which may not be the one joined.
+                        let channel_id = target.filter(|id| *id != 0).unwrap_or(channel_id);
                         // A flagged name is reported, and refused if the rule blocks, only when its member
                         // tries to send a message.
                         if let Some(word) = name_flag(&state, &user, &display)? {
