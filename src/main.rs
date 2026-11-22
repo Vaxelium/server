@@ -601,6 +601,10 @@ where
                         send(&mut writer, &ServerMsg::Peers { addrs }).await?;
                     }
 
+                    ClientMsg::Resync => {
+                        send_snapshot(&mut writer, &state).await?;
+                    }
+
                     ClientMsg::ListChannels => {
                         let (channels, categories, uncategorized) = {
                             let s = state.lock().unwrap();
@@ -1771,8 +1775,11 @@ where
                         send(&mut writer, &ServerMsg::ChannelRenamed { id, name }).await?;
                     }
                     Ok(_) => {}
-                    // Slow client fell behind; skip the dropped events and keep going.
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    // The client fell behind and some events were dropped. Send the server-wide state
+                    // again so the dropped changes are not left out.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        send_snapshot(&mut writer, &state).await?;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -2112,6 +2119,32 @@ async fn send_visible_channels<W: AsyncWrite + Unpin>(
         },
     )
     .await?;
+    Ok(())
+}
+
+/// Sends the server-wide state that members can change: roles, badges, custom emoji, and the channel
+/// and category overrides. Used when a client asks for it and after it missed events.
+async fn send_snapshot<W: AsyncWrite + Unpin>(writer: &mut W, state: &SharedState) -> anyhow::Result<()> {
+    let (roles, badges, overrides, modes, category_overrides, channel_members, category_members) = {
+        let s = state.lock().unwrap();
+        (
+            s.db.role_list()?,
+            s.db.badge_list()?,
+            s.db.channel_overrides()?,
+            s.db.slow_modes()?,
+            s.db.category_overrides()?,
+            s.db.channel_member_overrides()?,
+            s.db.category_member_overrides()?,
+        )
+    };
+    let emoji = emoji_list(state)?;
+    send(writer, &ServerMsg::Roles { roles }).await?;
+    send(writer, &ServerMsg::Badges { badges }).await?;
+    send(writer, &ServerMsg::CustomEmoji { emoji }).await?;
+    send(writer, &ServerMsg::ChannelOverrides { overrides }).await?;
+    send(writer, &ServerMsg::SlowModes { modes }).await?;
+    send(writer, &ServerMsg::CategoryOverrides { overrides: category_overrides }).await?;
+    send(writer, &ServerMsg::MemberOverrides { channels: channel_members, categories: category_members }).await?;
     Ok(())
 }
 
