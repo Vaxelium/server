@@ -487,16 +487,6 @@ impl Db {
         Ok(count > 0)
     }
 
-    /// The channel a message is in, if the message exists.
-    pub fn message_channel(&self, id: i64) -> rusqlite::Result<Option<String>> {
-        use rusqlite::OptionalExtension;
-        self.conn
-            .query_row("SELECT channel FROM messages WHERE id = ?1", params![id], |row| {
-                row.get(0)
-            })
-            .optional()
-    }
-
     /// The id of the channel a message is in.
     pub fn message_channel_id(&self, id: i64) -> rusqlite::Result<Option<i64>> {
         use rusqlite::OptionalExtension;
