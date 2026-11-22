@@ -277,6 +277,7 @@ async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
 
     // Every connection subscribes to this and forwards events for its own channel.
     let (tx, _) = broadcast::channel::<ServerMsg>(256);
+    tokio::spawn(run_scheduled(state.clone(), tx.clone(), auth_addr.clone()));
 
     // Members the auth service gave a random id since this server last ran: move what this server
     // stored under the old id to the new one. Needs the auth service; tried again on the next start.
@@ -606,6 +607,71 @@ where
                         send_snapshot(&mut writer, &state).await?;
                     }
 
+                    ClientMsg::ScheduleMessage { text, send_at } => {
+                        if channel_id == 0 {
+                            send(&mut writer, &ServerMsg::Error { text: "join a channel first".into() }).await?;
+                            continue;
+                        }
+                        if !may_in_channel(&state, &user, channel_id, perm::MANAGE_MESSAGES)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_SCHEDULE_PERMISSION.into() }).await?;
+                            continue;
+                        }
+                        let text = text.trim().to_string();
+                        if let Some(reason) = schedule_refusal(&state, &user, channel_id, &text, send_at, true)? {
+                            send(&mut writer, &ServerMsg::Error { text: reason }).await?;
+                            continue;
+                        }
+                        // The same AutoMod check as a message sent now, so a scheduled message is not a way around it.
+                        if let Some(reason) = schedule_automod(&state, &user, channel_id, &text)? {
+                            send(&mut writer, &ServerMsg::Error { text: reason }).await?;
+                            continue;
+                        }
+                        let messages = {
+                            let s = state.lock().unwrap();
+                            s.db.schedule_message(&user, channel_id, &text, send_at)?;
+                            s.db.scheduled_for(&user)?
+                        };
+                        send(&mut writer, &ServerMsg::Scheduled { messages }).await?;
+                    }
+                    ClientMsg::UpdateScheduled { id, text, send_at } => {
+                        // The message stays in the channel it was scheduled for.
+                        let channel = state.lock().unwrap().db.scheduled_channel(&user, id)?;
+                        let Some(channel) = channel else {
+                            send(&mut writer, &ServerMsg::Error { text: "that scheduled message is gone".into() }).await?;
+                            continue;
+                        };
+                        if !may_in_channel(&state, &user, channel, perm::MANAGE_MESSAGES)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_SCHEDULE_PERMISSION.into() }).await?;
+                            continue;
+                        }
+                        let text = text.trim().to_string();
+                        if let Some(reason) = schedule_refusal(&state, &user, channel, &text, send_at, false)? {
+                            send(&mut writer, &ServerMsg::Error { text: reason }).await?;
+                            continue;
+                        }
+                        if let Some(reason) = schedule_automod(&state, &user, channel, &text)? {
+                            send(&mut writer, &ServerMsg::Error { text: reason }).await?;
+                            continue;
+                        }
+                        let messages = {
+                            let s = state.lock().unwrap();
+                            s.db.update_scheduled(&user, id, &text, send_at)?;
+                            s.db.scheduled_for(&user)?
+                        };
+                        send(&mut writer, &ServerMsg::Scheduled { messages }).await?;
+                    }
+                    ClientMsg::ListScheduled => {
+                        let messages = state.lock().unwrap().db.scheduled_for(&user)?;
+                        send(&mut writer, &ServerMsg::Scheduled { messages }).await?;
+                    }
+                    ClientMsg::CancelScheduled { id } => {
+                        let messages = {
+                            let s = state.lock().unwrap();
+                            s.db.cancel_scheduled(&user, id)?;
+                            s.db.scheduled_for(&user)?
+                        };
+                        send(&mut writer, &ServerMsg::Scheduled { messages }).await?;
+                    }
                     ClientMsg::ListChannels => {
                         let (channels, categories, uncategorized) = {
                             let s = state.lock().unwrap();
@@ -1082,6 +1148,10 @@ where
                         let poll = match poll {
                             None => None,
                             Some(draft) => {
+                                if !may_in_channel(&state, &user, channel_id, perm::MANAGE_POLLS)? {
+                                    send(&mut writer, &ServerMsg::Error { text: NO_POLL_PERMISSION.into() }).await?;
+                                    continue;
+                                }
                                 if let Err(reason) = common::check_poll_question(&text).and_then(|_| common::check_poll_draft(&draft)) {
                                     send(&mut writer, &ServerMsg::Error { text: reason }).await?;
                                     continue;
@@ -2837,6 +2907,8 @@ fn mention_refusal(
 /// Says the channel cannot be used by this member, for the message that refuses them.
 const CANNOT_VIEW: &str = "you can't view that channel";
 const CANNOT_SEND: &str = "you can't send messages in that channel";
+const NO_POLL_PERMISSION: &str = "you need the Manage Polls permission to make a poll";
+const NO_SCHEDULE_PERMISSION: &str = "you need the Manage Messages permission to schedule a message";
 
 /// The permissions @everyone keeps until another role has them.
 const EVERYONE_KEEPS_BITS: u32 = perm::VIEW_CHANNEL | perm::SEND_MESSAGES;
@@ -3396,6 +3468,119 @@ fn arm_timeout_end(state: &SharedState, tx: &broadcast::Sender<ServerMsg>, membe
             let _ = tx.send(ServerMsg::TimeoutEnded { user: member });
         }
     });
+}
+
+/// Why a scheduled message cannot be kept as it is, or `None` when it can. Checks that the member may view and
+/// send in the channel, the text, the time, and (for a new message) how many they already have.
+fn schedule_refusal(
+    state: &SharedState,
+    user: &str,
+    channel: i64,
+    text: &str,
+    send_at: u64,
+    new_message: bool,
+) -> rusqlite::Result<Option<String>> {
+    let s = state.lock().unwrap();
+    let access = Access::new(&s.db, user)?;
+    if !access.allows(channel, perm::VIEW_CHANNEL) {
+        return Ok(Some(CANNOT_VIEW.to_string()));
+    }
+    if !access.allows(channel, perm::SEND_MESSAGES) {
+        return Ok(Some(CANNOT_SEND.to_string()));
+    }
+    if text.is_empty() {
+        return Ok(Some("a scheduled message needs some text".to_string()));
+    }
+    if text.chars().count() > MAX_TEXT_LEN {
+        return Ok(Some(format!("message longer than {MAX_TEXT_LEN} characters")));
+    }
+    let now = now_secs();
+    if send_at < now + common::SCHEDULE_MIN_LEAD_SECS || send_at > now + common::SCHEDULE_MAX_AHEAD_SECS {
+        return Ok(Some("a message can be scheduled from a minute to 30 days ahead".to_string()));
+    }
+    if new_message && s.db.scheduled_count(user)? >= common::MAX_SCHEDULED_PER_MEMBER {
+        return Ok(Some("you have too many scheduled messages on this server".to_string()));
+    }
+    Ok(None)
+}
+
+/// AutoMod's verdict on a scheduled message's text: the reason to show when it is blocked.
+fn schedule_automod(state: &SharedState, user: &str, channel: i64, text: &str) -> rusqlite::Result<Option<String>> {
+    Ok(match automod_refusal(state, user, channel, text, None)? {
+        Some(refusal) if refusal.block => Some(if refusal.notice.is_empty() { refusal.reason } else { refusal.notice }),
+        _ => None,
+    })
+}
+
+/// Posts the scheduled messages that have come due, every few seconds. Each is posted as its author would
+/// post it, if they may still post in that channel and are not timed out.
+async fn run_scheduled(state: SharedState, tx: broadcast::Sender<ServerMsg>, auth_addr: Arc<String>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tick.tick().await;
+        let due = match state.lock().unwrap().db.due_scheduled(now_secs()) {
+            Ok(due) => due,
+            Err(e) => {
+                eprintln!("could not read the scheduled messages: {e}");
+                continue;
+            }
+        };
+        for (id, author, channel_id, text) in due {
+            if let Err(e) = post_scheduled(&state, &tx, &auth_addr, id, &author, channel_id, text) {
+                eprintln!("scheduled message {id} could not be posted: {e}");
+            }
+        }
+    }
+}
+
+/// Posts one scheduled message and takes it off the list. A message whose author may no longer post there
+/// (or is timed out) is dropped without being posted.
+fn post_scheduled(
+    state: &SharedState,
+    tx: &broadcast::Sender<ServerMsg>,
+    auth_addr: &Arc<String>,
+    id: i64,
+    author: &str,
+    channel_id: i64,
+    text: String,
+) -> anyhow::Result<()> {
+    let now = now_secs();
+    let (may_post, name, channel) = {
+        let s = state.lock().unwrap();
+        let access = Access::new(&s.db, author)?;
+        // Still allowed to schedule: a message scheduled by someone who has lost the permission is not posted.
+        let may = access.allows(channel_id, perm::VIEW_CHANNEL)
+            && access.allows(channel_id, perm::SEND_MESSAGES)
+            && access.manages(channel_id, perm::MANAGE_MESSAGES)
+            && s.db.active_timeout(author, now)?.is_none();
+        let name = s.db.display_names()?.get(author).cloned().unwrap_or_else(|| author.to_string());
+        let channel = s.db.channel_name(channel_id)?.unwrap_or_default();
+        (may, name, channel)
+    };
+    if may_post {
+        let mut message = ChatMessage {
+            id: 0,
+            channel_id,
+            channel,
+            author: name,
+            author_id: author.to_string(),
+            text,
+            timestamp: now,
+            edited: false,
+            reactions: Vec::new(),
+            reply: None,
+            pinned: false,
+            report: None,
+            image: None,
+            poll: None,
+        };
+        message.id = state.lock().unwrap().db.save_message(&message)?;
+        let readers = state.lock().unwrap().db.readers_of(channel_id)?;
+        report_mentions(state, auth_addr, readers);
+        let _ = tx.send(ServerMsg::Message { message });
+    }
+    state.lock().unwrap().db.remove_scheduled(id)?;
+    Ok(())
 }
 
 /// A reason as typed: trimmed, and kept to a sensible length. Empty when none was given.

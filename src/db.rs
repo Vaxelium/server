@@ -54,6 +54,14 @@ CREATE TABLE IF NOT EXISTS channels (
     position    INTEGER NOT NULL DEFAULT 0,
     slow_mode   INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS scheduled_messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    author     TEXT NOT NULL,
+    channel_id INTEGER NOT NULL,
+    text       TEXT NOT NULL,
+    send_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS scheduled_by_time ON scheduled_messages (send_at);
 CREATE TABLE IF NOT EXISTS poll_choices (
     message_id INTEGER NOT NULL,
     option     INTEGER NOT NULL,
@@ -1907,6 +1915,86 @@ impl Db {
 
     /// Reactions for the given messages, keyed by message id. Each emoji appears once, in the
     /// order it was first added.
+    /// Saves a message to be posted to a channel at `send_at`. Returns its id.
+    pub fn schedule_message(&self, author: &str, channel_id: i64, text: &str, send_at: u64) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO scheduled_messages (author, channel_id, text, send_at) VALUES (?1, ?2, ?3, ?4)",
+            params![author, channel_id, text, send_at as i64],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The channel of one of the member's scheduled messages, or `None` when it is not theirs or is gone.
+    pub fn scheduled_channel(&self, author: &str, id: i64) -> rusqlite::Result<Option<i64>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT channel_id FROM scheduled_messages WHERE id = ?1 AND author = ?2",
+                params![id, author],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// Changes the text and time of one of the member's scheduled messages. False when it is not theirs.
+    pub fn update_scheduled(&self, author: &str, id: i64, text: &str, send_at: u64) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE scheduled_messages SET text = ?1, send_at = ?2 WHERE id = ?3 AND author = ?4",
+            params![text, send_at as i64, id, author],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// The messages this member has scheduled on this server, soonest first.
+    pub fn scheduled_for(&self, author: &str) -> rusqlite::Result<Vec<common::ScheduledMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, channel_id, text, send_at FROM scheduled_messages WHERE author = ?1 ORDER BY send_at, id",
+        )?;
+        let rows = stmt.query_map(params![author], |row| {
+            Ok(common::ScheduledMessage {
+                id: row.get(0)?,
+                channel_id: row.get(1)?,
+                text: row.get(2)?,
+                send_at: row.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn scheduled_count(&self, author: &str) -> rusqlite::Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM scheduled_messages WHERE author = ?1",
+            params![author],
+            |row| row.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Takes one of the member's scheduled messages off the list. False when it is not theirs or is gone.
+    pub fn cancel_scheduled(&self, author: &str, id: i64) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "DELETE FROM scheduled_messages WHERE id = ?1 AND author = ?2",
+            params![id, author],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// The scheduled messages due by `now`: (id, author, channel id, text).
+    pub fn due_scheduled(&self, now: u64) -> rusqlite::Result<Vec<(i64, String, i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, author, channel_id, text FROM scheduled_messages WHERE send_at <= ?1 ORDER BY send_at, id",
+        )?;
+        let rows = stmt.query_map(params![now as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        rows.collect()
+    }
+
+    pub fn remove_scheduled(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM scheduled_messages WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     /// The choices made on the polls among `ids`: for each message, the (option, voter) pairs.
     fn poll_votes_for(&self, ids: &[i64]) -> rusqlite::Result<std::collections::HashMap<i64, Vec<(usize, String)>>> {
         let mut out: std::collections::HashMap<i64, Vec<(usize, String)>> = Default::default();

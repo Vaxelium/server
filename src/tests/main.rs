@@ -1014,3 +1014,117 @@ mod snapshot_tests {
         assert_eq!(emoji.unwrap()[0].name, "party");
     }
 }
+
+mod schedule_tests {
+    use crate::*;
+    use std::sync::{Arc, Mutex};
+
+    fn state() -> SharedState {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("carol", "Carol", 2).unwrap();
+        db.transfer_ownership("owner").unwrap();
+        db.ensure_channel("general").unwrap();
+        Arc::new(Mutex::new(State {
+            db,
+            online: Vec::new(),
+            advertise: String::new(),
+            peer_failures: HashMap::new(),
+            dead_peers: HashMap::new(),
+            name_alerts: std::collections::HashSet::new(),
+            mention_log: HashMap::new(),
+            timeouts: HashMap::new(),
+            slow_last: HashMap::new(),
+        }))
+    }
+
+    #[test]
+    fn a_scheduled_message_is_due_only_once_its_time_has_come() {
+        let db = Db::open(":memory:").unwrap();
+        let channel = db.ensure_channel("general").unwrap();
+        db.schedule_message("owner", channel, "later", 1000).unwrap();
+        assert!(db.due_scheduled(999).unwrap().is_empty());
+        let due = db.due_scheduled(1000).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].3, "later");
+    }
+
+    #[test]
+    fn members_see_and_cancel_only_their_own_scheduled_messages() {
+        let db = Db::open(":memory:").unwrap();
+        let channel = db.ensure_channel("general").unwrap();
+        let mine = db.schedule_message("owner", channel, "mine", 1000).unwrap();
+        db.schedule_message("carol", channel, "hers", 1000).unwrap();
+        assert_eq!(db.scheduled_for("owner").unwrap().len(), 1);
+        assert!(!db.cancel_scheduled("carol", mine).unwrap(), "carol cannot cancel owner's message");
+        assert!(db.cancel_scheduled("owner", mine).unwrap());
+        assert!(db.scheduled_for("owner").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_due_message_is_posted_as_its_author_and_taken_off_the_list() {
+        let state = state();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let channel = state.lock().unwrap().db.ensure_channel("general").unwrap();
+        let id = state.lock().unwrap().db.schedule_message("owner", channel, "good morning", 1000).unwrap();
+        post_scheduled(&state, &tx, &Arc::new(String::new()), id, "owner", channel, "good morning".into()).unwrap();
+        match rx.try_recv() {
+            Ok(ServerMsg::Message { message }) => {
+                assert_eq!(message.text, "good morning");
+                assert_eq!(message.author_id, "owner");
+            }
+            other => panic!("the message is posted: {other:?}"),
+        }
+        assert!(state.lock().unwrap().db.scheduled_for("owner").unwrap().is_empty());
+    }
+}
+
+mod schedule_permission_tests {
+    use crate::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn a_due_message_is_not_posted_once_its_author_lacks_manage_messages() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("carol", "Carol", 2).unwrap();
+        db.transfer_ownership("owner").unwrap();
+        let channel = db.ensure_channel("general").unwrap();
+        let id = db.schedule_message("carol", channel, "sneaky", 1000).unwrap();
+        let state: SharedState = Arc::new(Mutex::new(State {
+            db,
+            online: Vec::new(),
+            advertise: String::new(),
+            peer_failures: HashMap::new(),
+            dead_peers: HashMap::new(),
+            name_alerts: std::collections::HashSet::new(),
+            mention_log: HashMap::new(),
+            timeouts: HashMap::new(),
+            slow_last: HashMap::new(),
+        }));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        post_scheduled(&state, &tx, &Arc::new(String::new()), id, "carol", channel, "sneaky".into()).unwrap();
+        assert!(rx.try_recv().is_err(), "nothing is posted for a member without Manage Messages");
+        assert!(state.lock().unwrap().db.scheduled_for("carol").unwrap().is_empty(), "and it is dropped from the list");
+    }
+}
+
+mod schedule_edit_tests {
+    use crate::*;
+
+    #[test]
+    fn a_scheduled_message_can_be_changed_by_its_author_only_and_keeps_its_channel() {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("carol", "Carol", 2).unwrap();
+        let channel = db.ensure_channel("general").unwrap();
+        let id = db.schedule_message("owner", channel, "draft", 1000).unwrap();
+        assert_eq!(db.scheduled_channel("owner", id).unwrap(), Some(channel));
+        assert_eq!(db.scheduled_channel("carol", id).unwrap(), None, "carol cannot see it");
+        assert!(!db.update_scheduled("carol", id, "mine now", 2000).unwrap(), "carol cannot change it");
+        assert!(db.update_scheduled("owner", id, "final", 2000).unwrap());
+        let kept = db.scheduled_for("owner").unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!((kept[0].text.as_str(), kept[0].send_at, kept[0].channel_id), ("final", 2000, channel));
+    }
+}
