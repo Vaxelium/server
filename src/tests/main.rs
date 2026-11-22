@@ -947,3 +947,70 @@ mod emoji_change_tests {
         assert_eq!(refused.as_deref(), Some("that image could not be read"));
     }
 }
+
+mod snapshot_tests {
+    use crate::*;
+    use std::sync::{Arc, Mutex};
+
+    const STILL: &[u8] = include_bytes!("fixtures/emoji-still.png");
+
+    fn state() -> SharedState {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.transfer_ownership("owner").unwrap();
+        Arc::new(Mutex::new(State {
+            db,
+            online: Vec::new(),
+            advertise: String::new(),
+            peer_failures: HashMap::new(),
+            dead_peers: HashMap::new(),
+            name_alerts: std::collections::HashSet::new(),
+            mention_log: HashMap::new(),
+            timeouts: HashMap::new(),
+            slow_last: HashMap::new(),
+        }))
+    }
+
+    /// The messages a snapshot sends, in order, as they would be read by a client.
+    async fn snapshot(state: &SharedState) -> Vec<ServerMsg> {
+        let mut out: Vec<u8> = Vec::new();
+        send_snapshot(&mut out, state).await.unwrap();
+        String::from_utf8(out).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_sends_each_server_wide_list_once_and_in_order() {
+        let msgs = snapshot(&state()).await;
+        let kinds: Vec<&str> = msgs
+            .iter()
+            .map(|m| match m {
+                ServerMsg::Roles { .. } => "roles",
+                ServerMsg::Badges { .. } => "badges",
+                ServerMsg::CustomEmoji { .. } => "emoji",
+                ServerMsg::ChannelOverrides { .. } => "channel overrides",
+                ServerMsg::SlowModes { .. } => "slow modes",
+                ServerMsg::CategoryOverrides { .. } => "category overrides",
+                ServerMsg::MemberOverrides { .. } => "member overrides",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["roles", "badges", "emoji", "channel overrides", "slow modes", "category overrides", "member overrides"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resent_snapshot_includes_a_change_that_was_missed() {
+        let state = state();
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        // The emoji was added while the connection was not reading its events.
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, STILL);
+        change_emoji(&state, &tx, "owner", EmojiChange::Add { name: "party".into(), image: encoded }).unwrap();
+        let emoji = snapshot(&state).await.into_iter().find_map(|m| match m {
+            ServerMsg::CustomEmoji { emoji } => Some(emoji),
+            _ => None,
+        });
+        assert_eq!(emoji.unwrap()[0].name, "party");
+    }
+}
