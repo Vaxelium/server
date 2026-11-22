@@ -475,6 +475,15 @@ impl Db {
     }
 
     /// Whether `user` is one of the two members of a direct message channel.
+    /// Whether a channel can be used by this user as a direct message: a channel that is not a direct message
+    /// always can, and a direct message only by its members. Found by the channel's id.
+    pub fn dm_channel_allows(&self, channel_id: i64, user: &str) -> rusqlite::Result<bool> {
+        match self.channel_name(channel_id)? {
+            Some(name) if name.starts_with("dm-") => self.is_dm_member(&name, user),
+            _ => Ok(true),
+        }
+    }
+
     pub fn is_dm_member(&self, channel: &str, user: &str) -> rusqlite::Result<bool> {
         let Some(id) = channel.strip_prefix("dm-").and_then(|n| n.parse::<i64>().ok()) else {
             return Ok(false);
