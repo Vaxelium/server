@@ -564,6 +564,7 @@ where
                 pinned: false,
                 report: None,
                 image,
+                poll: None,
             };
             message.id = state.lock().unwrap().db.save_message(&message)?;
             let _ = tx.send(ServerMsg::Message { message });
@@ -989,7 +990,7 @@ where
                         }
                     }
 
-                    ClientMsg::Say { text, reply_to, channel: target } => {
+                    ClientMsg::Say { text, reply_to, channel: target, poll } => {
                         // A forwarded message goes to the channel it names, which may not be the one joined.
                         let channel_id = target.filter(|id| *id != 0).unwrap_or(channel_id);
                         // A flagged name is reported, and refused if the rule blocks, only when its member
@@ -1077,6 +1078,38 @@ where
                                 continue;
                             }
                         }
+                        // A poll's options go through the same checks as the text, and its question is the text.
+                        let poll = match poll {
+                            None => None,
+                            Some(draft) => {
+                                if let Err(reason) = common::check_poll_question(&text).and_then(|_| common::check_poll_draft(&draft)) {
+                                    send(&mut writer, &ServerMsg::Error { text: reason }).await?;
+                                    continue;
+                                }
+                                let mut refused = None;
+                                for option in &draft.options {
+                                    if let Some(refusal) = automod_refusal(&state, &user, channel_id, option, None)? {
+                                        if refusal.block {
+                                            refused = Some(if refusal.notice.is_empty() { refusal.reason } else { refusal.notice });
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(reason) = refused {
+                                    send(&mut writer, &ServerMsg::Error { text: format!("a poll option was refused: {reason}") }).await?;
+                                    continue;
+                                }
+                                Some(common::Poll {
+                                    options: draft
+                                        .options
+                                        .iter()
+                                        .map(|o| common::PollOption { text: o.trim().to_string(), voters: Vec::new() })
+                                        .collect(),
+                                    ends: now_secs() + draft.duration_secs,
+                                    multiple: draft.multiple,
+                                })
+                            }
+                        };
                         let mut message = ChatMessage {
                             id: 0,
                             channel_id,
@@ -1091,6 +1124,7 @@ where
                             pinned: false,
                             report: None,
                             image: None,
+                            poll,
                         };
                         // A reply must answer a message in the same channel; anything else is sent plain.
                         if let Some(id) = reply_to {
@@ -1313,6 +1347,30 @@ where
                             }
                             None => {
                                 send(&mut writer, &ServerMsg::Error { text: "that message no longer exists".into() }).await?;
+                            }
+                        }
+                    }
+                    ClientMsg::Vote { id, option } => {
+                        if !message_visible(&state, &user, id)? {
+                            send(&mut writer, &ServerMsg::Error { text: "that message no longer exists".into() }).await?;
+                            continue;
+                        }
+                        let outcome = state.lock().unwrap().db.vote(id, option, &user, now_secs())?;
+                        match outcome {
+                            db::VoteOutcome::Voted { channel_id, poll } => {
+                                let _ = tx.send(ServerMsg::PollVoted { channel_id, id, poll });
+                            }
+                            db::VoteOutcome::NoMessage => {
+                                send(&mut writer, &ServerMsg::Error { text: "that message no longer exists".into() }).await?;
+                            }
+                            db::VoteOutcome::NotAPoll => {
+                                send(&mut writer, &ServerMsg::Error { text: "that message is not a poll".into() }).await?;
+                            }
+                            db::VoteOutcome::Closed => {
+                                send(&mut writer, &ServerMsg::Error { text: "this poll has ended".into() }).await?;
+                            }
+                            db::VoteOutcome::NoSuchOption => {
+                                send(&mut writer, &ServerMsg::Error { text: "that option is not in this poll".into() }).await?;
                             }
                         }
                     }
@@ -1678,6 +1736,11 @@ where
                     Ok(ServerMsg::Reactions { channel_id: c, id, reactions }) if c == channel_id => {
                         if Access::new(&state.lock().unwrap().db, &user)?.allows(c, perm::VIEW_CHANNEL) {
                             send(&mut writer, &ServerMsg::Reactions { channel_id: c, id, reactions }).await?;
+                        }
+                    }
+                    Ok(ServerMsg::PollVoted { channel_id: c, id, poll }) if c == channel_id => {
+                        if Access::new(&state.lock().unwrap().db, &user)?.allows(c, perm::VIEW_CHANNEL) {
+                            send(&mut writer, &ServerMsg::PollVoted { channel_id: c, id, poll }).await?;
                         }
                     }
                     Ok(ServerMsg::Typing { channel_id: c, user: who, name }) => {
@@ -2552,6 +2615,7 @@ fn automod_post(
             pinned: false,
             report,
             image: None,
+            poll: None,
         };
         message.id = s.db.save_message(&message)?;
         message

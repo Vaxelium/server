@@ -54,6 +54,12 @@ CREATE TABLE IF NOT EXISTS channels (
     position    INTEGER NOT NULL DEFAULT 0,
     slow_mode   INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS poll_choices (
+    message_id INTEGER NOT NULL,
+    option     INTEGER NOT NULL,
+    user       TEXT NOT NULL,
+    PRIMARY KEY (message_id, user, option)
+);
 CREATE TABLE IF NOT EXISTS reactions (
     message_id INTEGER NOT NULL,
     emoji      TEXT NOT NULL,
@@ -323,6 +329,8 @@ impl Db {
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN reply_to INTEGER", []);
         // Messages made before pins lack this column; they are not pinned. Set to when it was pinned.
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN pinned_at INTEGER", []);
+        // Messages made before polls lack this column; they are not polls. Holds the options and end time as JSON.
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN poll TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN report TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN image BLOB", []);
         // Channels made before they could be ordered lack this column; they keep their name order.
@@ -1776,8 +1784,8 @@ impl Db {
             .as_deref()
             .and_then(|b64| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok());
         self.conn.execute(
-            "INSERT INTO messages (channel, channel_id, author, text, timestamp, reply_to, report, image)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO messages (channel, channel_id, author, text, timestamp, reply_to, report, image, poll)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             // Messages are stored under the author's id, so they stay with the account.
             params![
                 m.channel,
@@ -1787,7 +1795,13 @@ impl Db {
                 m.timestamp as i64,
                 m.reply.as_ref().map(|r| r.id),
                 m.report.as_ref().and_then(|r| serde_json::to_string(r).ok()),
-                image
+                image,
+                // Votes are kept apart; only the options and the end time are stored with the message.
+                m.poll.as_ref().and_then(|p| serde_json::to_string(&common::Poll {
+                    options: p.options.iter().map(|o| common::PollOption { text: o.text.clone(), voters: Vec::new() }).collect(),
+                    ends: p.ends,
+                    multiple: p.multiple,
+                }).ok())
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -1893,6 +1907,81 @@ impl Db {
 
     /// Reactions for the given messages, keyed by message id. Each emoji appears once, in the
     /// order it was first added.
+    /// The choices made on the polls among `ids`: for each message, the (option, voter) pairs.
+    fn poll_votes_for(&self, ids: &[i64]) -> rusqlite::Result<std::collections::HashMap<i64, Vec<(usize, String)>>> {
+        let mut out: std::collections::HashMap<i64, Vec<(usize, String)>> = Default::default();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT message_id, option, user FROM poll_choices WHERE message_id IN ({list}) ORDER BY rowid"
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+        })?;
+        for row in rows {
+            let (message, option, user) = row?;
+            out.entry(message).or_default().push((option as usize, user));
+        }
+        Ok(out)
+    }
+
+    /// Records a member's choice on a poll. On a single-choice poll it replaces the option they chose before;
+    /// on a poll that allows several, it adds the option, or takes it off if they chose it already. Votes are
+    /// refused once voting has ended, and for options the poll does not have.
+    pub fn vote(&self, id: i64, option: usize, user: &str, now: u64) -> rusqlite::Result<VoteOutcome> {
+        use rusqlite::OptionalExtension;
+        let row: Option<(i64, Option<String>)> = self
+            .conn
+            .query_row("SELECT channel_id, poll FROM messages WHERE id = ?1", params![id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?;
+        let Some((channel_id, poll_json)) = row else {
+            return Ok(VoteOutcome::NoMessage);
+        };
+        let Some(poll) = poll_json.and_then(|json| serde_json::from_str::<common::Poll>(&json).ok()) else {
+            return Ok(VoteOutcome::NotAPoll);
+        };
+        if poll.closed(now) {
+            return Ok(VoteOutcome::Closed);
+        }
+        if option >= poll.options.len() {
+            return Ok(VoteOutcome::NoSuchOption);
+        }
+        if poll.multiple {
+            let taken = self.conn.execute(
+                "DELETE FROM poll_choices WHERE message_id = ?1 AND user = ?2 AND option = ?3",
+                params![id, user, option as i64],
+            )?;
+            if taken == 0 {
+                self.conn.execute(
+                    "INSERT INTO poll_choices (message_id, option, user) VALUES (?1, ?2, ?3)",
+                    params![id, option as i64, user],
+                )?;
+            }
+        } else {
+            self.conn.execute(
+                "DELETE FROM poll_choices WHERE message_id = ?1 AND user = ?2",
+                params![id, user],
+            )?;
+            self.conn.execute(
+                "INSERT INTO poll_choices (message_id, option, user) VALUES (?1, ?2, ?3)",
+                params![id, option as i64, user],
+            )?;
+        }
+        // Load the poll again so the answer carries everyone's votes.
+        let votes = self.poll_votes_for(&[id])?.remove(&id).unwrap_or_default();
+        let mut poll = poll;
+        for (option, voter) in votes {
+            if let Some(o) = poll.options.get_mut(option) {
+                o.voters.push(voter);
+            }
+        }
+        Ok(VoteOutcome::Voted { channel_id, poll })
+    }
+
     fn reactions_for(&self, ids: &[i64]) -> rusqlite::Result<std::collections::HashMap<i64, Vec<common::Reaction>>> {
         let mut out: std::collections::HashMap<i64, Vec<common::Reaction>> = Default::default();
         if ids.is_empty() {
@@ -1947,7 +2036,7 @@ impl Db {
     /// The most recent `HISTORY_LEN` messages in a channel, oldest first.
     pub fn history(&self, channel: i64) -> rusqlite::Result<Vec<ChatMessage>> {
         self.load_messages(
-            "SELECT id, channel_id, author, text, timestamp, edited, reply_to, pinned_at, report
+            "SELECT id, channel_id, author, text, timestamp, edited, reply_to, pinned_at, report, poll
              FROM messages WHERE channel_id = ?1 ORDER BY id DESC LIMIT ?2",
             "m.id ASC",
             params![channel, HISTORY_LEN],
@@ -1957,7 +2046,7 @@ impl Db {
     /// A channel's pinned messages, the most recently pinned first.
     pub fn pins(&self, channel: i64) -> rusqlite::Result<Vec<ChatMessage>> {
         self.load_messages(
-            "SELECT id, channel_id, author, text, timestamp, edited, reply_to, pinned_at, report
+            "SELECT id, channel_id, author, text, timestamp, edited, reply_to, pinned_at, report, poll
              FROM messages WHERE channel_id = ?1 AND pinned_at IS NOT NULL
              ORDER BY pinned_at DESC, id DESC LIMIT ?2",
             "m.pinned_at DESC, m.id DESC",
@@ -2002,7 +2091,7 @@ impl Db {
     fn load_messages(&self, sql: &str, order: &str, args: impl rusqlite::Params) -> rusqlite::Result<Vec<ChatMessage>> {
         let sql = format!(
             "SELECT m.id, m.channel_id, m.author, m.text, m.timestamp, m.edited, m.reply_to, r.author, r.text,
-                    m.pinned_at IS NOT NULL, m.report
+                    m.pinned_at IS NOT NULL, m.report, m.poll
              FROM ({sql}) AS m
              LEFT JOIN messages AS r ON r.id = m.reply_to
              ORDER BY {order}"
@@ -2037,6 +2126,9 @@ impl Db {
                     .get::<_, Option<String>>(10)?
                     .and_then(|json| serde_json::from_str(&json).ok()),
                 image: None,
+                poll: row
+                    .get::<_, Option<String>>(11)?
+                    .and_then(|json| serde_json::from_str(&json).ok()),
             })
         })?;
         let mut messages: Vec<ChatMessage> = rows.collect::<rusqlite::Result<_>>()?;
@@ -2068,6 +2160,16 @@ impl Db {
         }
         let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
         let mut reactions = self.reactions_for(&ids)?;
+        let mut votes = self.poll_votes_for(&ids)?;
+        for m in &mut messages {
+            if let Some(poll) = m.poll.as_mut() {
+                for (option, voter) in votes.remove(&m.id).unwrap_or_default() {
+                    if let Some(o) = poll.options.get_mut(option) {
+                        o.voters.push(voter);
+                    }
+                }
+            }
+        }
         // Pictures are only kept for join notices, so most messages have none to load.
         let mut images = self.images_for(&ids)?;
         for m in &mut messages {
@@ -2076,6 +2178,18 @@ impl Db {
         }
         Ok(messages)
     }
+}
+
+/// What became of a member's vote on a poll.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VoteOutcome {
+    /// The vote is counted; the channel and the poll with everyone's votes.
+    Voted { channel_id: i64, poll: common::Poll },
+    NoMessage,
+    NotAPoll,
+    /// Voting has ended.
+    Closed,
+    NoSuchOption,
 }
 
 /// A channel already has as many pinned messages as it can hold.
