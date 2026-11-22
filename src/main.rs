@@ -3055,7 +3055,8 @@ fn normalize_channel(name: &str) -> String {
         .trim_start_matches('#')
         .to_lowercase()
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        // Any character may name a channel, emoji and symbols included. Spaces and control characters are dropped.
+        .filter(|c| !c.is_whitespace() && !c.is_control())
         .take(32)
         .collect()
 }

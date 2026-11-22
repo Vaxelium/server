@@ -820,3 +820,18 @@ mod badge_tests {
         assert!(db.all_member_badges().unwrap().get("bob").is_none());
     }
 }
+
+mod channel_name_tests {
+    use super::super::*;
+
+    #[test]
+    fn channel_names_keep_emoji_and_symbols() {
+        assert_eq!(normalize_channel("#General"), "general");
+        assert_eq!(normalize_channel("  dev-ops_1  "), "dev-ops_1");
+        assert_eq!(normalize_channel("🎮games"), "🎮games");
+        assert_eq!(normalize_channel("café ☕ chat"), "café☕chat");
+        assert_eq!(normalize_channel("a\tb\nc"), "abc", "whitespace and control characters are dropped");
+        assert_eq!(normalize_channel("   "), "", "a name with nothing left is empty");
+        assert_eq!(normalize_channel(&"🎮".repeat(40)).chars().count(), 32, "at most 32 characters");
+    }
+}
