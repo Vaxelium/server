@@ -835,3 +835,115 @@ mod channel_name_tests {
         assert_eq!(normalize_channel(&"🎮".repeat(40)).chars().count(), 32, "at most 32 characters");
     }
 }
+
+#[cfg(test)]
+mod emoji_image_tests {
+    use crate::emoji_image::{check, MAX_BYTES, MAX_SIZE};
+
+    const STILL: &[u8] = include_bytes!("fixtures/emoji-still.png");
+    const ANIMATED: &[u8] = include_bytes!("fixtures/emoji-animated.png");
+
+    #[test]
+    fn png_and_animated_png_are_accepted() {
+        assert_eq!(check(STILL), Ok(()));
+        assert_eq!(check(ANIMATED), Ok(()));
+    }
+
+    #[test]
+    fn other_formats_are_refused_whatever_their_name() {
+        // A GIF, a JPEG and a WebP, by their signatures. The name does not matter.
+        assert!(check(b"GIF89a\x10\x00\x10\x00").is_err());
+        assert!(check(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, b'J', b'F', b'I', b'F']).is_err());
+        assert!(check(b"RIFF\x24\x00\x00\x00WEBPVP8 ").is_err());
+    }
+
+    #[test]
+    fn a_png_that_is_really_something_else_is_refused() {
+        // The signature is right, but the rest is not a PNG.
+        let mut fake = STILL[..8].to_vec();
+        fake.extend_from_slice(b"not really a png at all");
+        assert!(check(&fake).is_err());
+    }
+
+    #[test]
+    fn size_limits_are_enforced() {
+        let big = vec![0u8; MAX_BYTES + 1];
+        assert!(check(&big).unwrap_err().contains("KB"), "too many bytes");
+        // Dimensions are read from the header: a 16 by 16 picture is fine, a wider header is not.
+        let mut wide = STILL.to_vec();
+        // IHDR's width is the four bytes after the chunk type, which starts at byte 12.
+        wide[16..20].copy_from_slice(&(MAX_SIZE + 1).to_be_bytes());
+        assert!(check(&wide).is_err());
+    }
+
+    #[test]
+    fn emoji_names_are_short_lowercase_words() {
+        use crate::valid_emoji_name;
+        assert!(valid_emoji_name("party"));
+        assert!(valid_emoji_name("cat_2"));
+        assert!(!valid_emoji_name("a"), "too short");
+        assert!(!valid_emoji_name("Party"), "capitals are not allowed");
+        assert!(!valid_emoji_name("hi there"), "spaces are not allowed");
+        assert!(!valid_emoji_name("🎉party"), "only letters, digits and underscores");
+        assert!(!valid_emoji_name(&"a".repeat(33)), "too long");
+    }
+}
+
+#[cfg(test)]
+mod emoji_change_tests {
+    use crate::*;
+    use std::sync::{Arc, Mutex};
+
+    const STILL: &[u8] = include_bytes!("fixtures/emoji-still.png");
+
+    fn state_with_owner() -> SharedState {
+        let db = Db::open(":memory:").unwrap();
+        db.add_member("owner", "Owner", 1).unwrap();
+        db.add_member("carol", "Carol", 2).unwrap();
+        db.transfer_ownership("owner").unwrap();
+        Arc::new(Mutex::new(State {
+            db,
+            online: Vec::new(),
+            advertise: String::new(),
+            peer_failures: HashMap::new(),
+            dead_peers: HashMap::new(),
+            name_alerts: std::collections::HashSet::new(),
+            mention_log: HashMap::new(),
+            timeouts: HashMap::new(),
+            slow_last: HashMap::new(),
+        }))
+    }
+
+    fn encoded(bytes: &[u8]) -> String {
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+    }
+
+    #[test]
+    fn the_owner_adds_an_emoji_and_everyone_is_sent_the_list() {
+        let state = state_with_owner();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let refused = change_emoji(&state, &tx, "owner", EmojiChange::Add { name: "Party".into(), image: encoded(STILL) }).unwrap();
+        assert_eq!(refused, None, "a PNG from the owner is added");
+        assert_eq!(state.lock().unwrap().db.emoji_count().unwrap(), 1);
+        match rx.try_recv() {
+            Ok(ServerMsg::CustomEmoji { emoji }) => assert_eq!(emoji[0].name, "party"),
+            other => panic!("everyone is sent the list: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_member_without_the_permission_is_refused() {
+        let state = state_with_owner();
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let refused = change_emoji(&state, &tx, "carol", EmojiChange::Add { name: "party".into(), image: encoded(STILL) }).unwrap();
+        assert!(refused.unwrap().contains("Manage Emoji"));
+    }
+
+    #[test]
+    fn a_picture_that_is_not_base64_is_refused_with_a_reason() {
+        let state = state_with_owner();
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let refused = change_emoji(&state, &tx, "owner", EmojiChange::Add { name: "party".into(), image: "not base64!".into() }).unwrap();
+        assert_eq!(refused.as_deref(), Some("that image could not be read"));
+    }
+}

@@ -98,6 +98,11 @@ CREATE TABLE IF NOT EXISTS badges (
     name  TEXT NOT NULL UNIQUE,
     color TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS custom_emoji (
+    id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    name  TEXT NOT NULL UNIQUE,
+    image BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS member_badges (
     user_id  TEXT NOT NULL,
     badge_id INTEGER NOT NULL,
@@ -1680,6 +1685,40 @@ impl Db {
         self.conn
             .execute("DELETE FROM member_badges WHERE badge_id = ?1", params![id])?;
         Ok(self.conn.execute("DELETE FROM badges WHERE id = ?1", params![id])? > 0)
+    }
+
+    /// Every custom emoji as (id, name, image bytes), oldest first.
+    pub fn emoji_rows(&self) -> rusqlite::Result<Vec<(i64, String, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare("SELECT id, name, image FROM custom_emoji ORDER BY id")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect()
+    }
+
+    /// How many custom emoji the server has.
+    pub fn emoji_count(&self) -> rusqlite::Result<i64> {
+        self.conn.query_row("SELECT COUNT(*) FROM custom_emoji", [], |row| row.get(0))
+    }
+
+    /// Adds a custom emoji. Returns None when the name is already taken.
+    pub fn add_emoji(&self, name: &str, image: &[u8]) -> rusqlite::Result<Option<i64>> {
+        let added = self.conn.execute(
+            "INSERT OR IGNORE INTO custom_emoji (name, image) VALUES (?1, ?2)",
+            params![name, image],
+        )?;
+        Ok((added > 0).then(|| self.conn.last_insert_rowid()))
+    }
+
+    /// Whether the server has a custom emoji with this name.
+    pub fn emoji_named(&self, name: &str) -> rusqlite::Result<bool> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM custom_emoji WHERE name = ?1", params![name], |row| row.get(0))?;
+        Ok(count > 0)
+    }
+
+    /// Removes a custom emoji. False when there is none with this id.
+    pub fn delete_emoji(&self, id: i64) -> rusqlite::Result<bool> {
+        Ok(self.conn.execute("DELETE FROM custom_emoji WHERE id = ?1", params![id])? > 0)
     }
 
     /// Gives a member a badge, or takes it away.

@@ -1,6 +1,7 @@
 mod card;
 mod db;
 mod discovery;
+mod emoji_image;
 mod web;
 
 use std::collections::HashMap;
@@ -472,6 +473,8 @@ where
     send(&mut writer, &ServerMsg::Roles { roles }).await?;
     let badges = state.lock().unwrap().db.badge_list()?;
     send(&mut writer, &ServerMsg::Badges { badges }).await?;
+    let emoji = emoji_list(&state)?;
+    send(&mut writer, &ServerMsg::CustomEmoji { emoji }).await?;
     let overrides = state.lock().unwrap().db.channel_overrides()?;
     send(&mut writer, &ServerMsg::ChannelOverrides { overrides }).await?;
     let modes = state.lock().unwrap().db.slow_modes()?;
@@ -813,6 +816,18 @@ where
                     ClientMsg::SetMemberRole { user: member, role, on } => {
                         let change = RoleChange::Member { user: member, role, on };
                         if let Some(text) = change_roles(&state, &tx, &user, change)? {
+                            send(&mut writer, &ServerMsg::Error { text }).await?;
+                        }
+                    }
+
+                    ClientMsg::AddEmoji { name, image } => {
+                        if let Some(text) = change_emoji(&state, &tx, &user, EmojiChange::Add { name, image })? {
+                            send(&mut writer, &ServerMsg::Error { text }).await?;
+                        }
+                    }
+
+                    ClientMsg::RemoveEmoji { emoji } => {
+                        if let Some(text) = change_emoji(&state, &tx, &user, EmojiChange::Remove { emoji })? {
                             send(&mut writer, &ServerMsg::Error { text }).await?;
                         }
                     }
@@ -1262,6 +1277,13 @@ where
                         if !common::is_reaction(&emoji) {
                             send(&mut writer, &ServerMsg::Error { text: "that reaction is not allowed".into() }).await?;
                             continue;
+                        }
+                        // A custom emoji reaction must be one of this server's own emoji.
+                        if let Some(name) = common::custom_emoji_name(&emoji) {
+                            if !state.lock().unwrap().db.emoji_named(name)? {
+                                send(&mut writer, &ServerMsg::Error { text: format!("this server has no emoji called :{name}:") }).await?;
+                                continue;
+                            }
                         }
                         let allowed = {
                             let s = state.lock().unwrap();
@@ -2948,6 +2970,76 @@ fn apply_role_change(db: &Db, actor: &str, change: RoleChange) -> rusqlite::Resu
 /// Applies a role change and tells everyone about the new roles and members. Returns why the change
 /// was refused, if it was.
 /// A change to the badges of this server, made by someone who may manage roles.
+enum EmojiChange {
+    Add { name: String, image: String },
+    Remove { emoji: i64 },
+}
+
+/// The most custom emoji one server can have.
+const MAX_EMOJI: i64 = 50;
+
+/// Every custom emoji, with its image as base64.
+fn emoji_list(state: &SharedState) -> rusqlite::Result<Vec<common::CustomEmoji>> {
+    let rows = state.lock().unwrap().db.emoji_rows()?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, name, bytes)| common::CustomEmoji {
+            id,
+            name,
+            image: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
+        })
+        .collect())
+}
+
+/// Whether a custom emoji's name is 2 to 32 lowercase letters, digits or underscores.
+pub fn valid_emoji_name(name: &str) -> bool {
+    (2..=32).contains(&name.chars().count())
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Adds or removes a custom emoji, then sends every connection the emoji list. Returns the reason when refused.
+fn change_emoji(
+    state: &SharedState,
+    tx: &broadcast::Sender<ServerMsg>,
+    user: &str,
+    change: EmojiChange,
+) -> rusqlite::Result<Option<String>> {
+    if !may(state, user, perm::MANAGE_EMOJI)? {
+        return Ok(Some("you need the Manage Emoji permission to change emoji".into()));
+    }
+    let refused = match change {
+        EmojiChange::Add { name, image } => {
+            let name = name.trim().to_lowercase();
+            let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, image.trim()).ok();
+            if !valid_emoji_name(&name) {
+                Some("an emoji needs a name of 2 to 32 letters, digits or underscores".to_string())
+            } else if let Some(err) = bytes.as_ref().map_or(Some("that image could not be read".to_string()), |b| {
+                emoji_image::check(b).err()
+            }) {
+                Some(err)
+            } else {
+                let s = state.lock().unwrap();
+                let bytes = bytes.unwrap_or_default();
+                if s.db.emoji_count()? >= MAX_EMOJI {
+                    Some(format!("a server can have at most {MAX_EMOJI} emoji"))
+                } else if s.db.add_emoji(&name, &bytes)?.is_none() {
+                    Some("an emoji with that name already exists".to_string())
+                } else {
+                    None
+                }
+            }
+        }
+        EmojiChange::Remove { emoji } => match state.lock().unwrap().db.delete_emoji(emoji)? {
+            true => None,
+            false => Some("there is no such emoji".to_string()),
+        },
+    };
+    if refused.is_none() {
+        let _ = tx.send(ServerMsg::CustomEmoji { emoji: emoji_list(state)? });
+    }
+    Ok(refused)
+}
+
 enum BadgeChange {
     Create { name: String, color: String },
     Delete { badge: i64 },

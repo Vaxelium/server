@@ -1052,3 +1052,24 @@ mod message_visibility_tests {
         assert!(!db.dm_channel_allows(dm, "bob").unwrap(), "bob is not in that direct message");
     }
 }
+
+#[cfg(test)]
+mod custom_emoji_tests {
+    use super::super::*;
+
+    #[test]
+    fn custom_emoji_are_added_listed_and_removed_by_name_and_id() {
+        let db = Db::open(":memory:").unwrap();
+        assert_eq!(db.emoji_count().unwrap(), 0);
+        let party = db.add_emoji("party", b"png-bytes").unwrap().expect("added");
+        assert!(db.add_emoji("party", b"other").unwrap().is_none(), "the name is taken");
+        assert_eq!(db.emoji_count().unwrap(), 1);
+        assert!(db.emoji_named("party").unwrap(), "a reaction can use it by name");
+        assert!(!db.emoji_named("missing").unwrap());
+        assert_eq!(db.emoji_rows().unwrap(), vec![(party, "party".to_string(), b"png-bytes".to_vec())]);
+        assert!(db.delete_emoji(party).unwrap());
+        assert!(!db.delete_emoji(party).unwrap(), "already removed");
+        assert_eq!(db.emoji_count().unwrap(), 0);
+    }
+}
+
