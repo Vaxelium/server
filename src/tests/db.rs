@@ -17,6 +17,7 @@ mod tests {
             pinned: false,
             report: None,
             image: None,
+            poll: None,
         }
     }
 
@@ -422,6 +423,7 @@ mod rename_tests {
             pinned: false,
             report: None,
             image: None,
+            poll: None,
         };
         db.save_message(&m).unwrap();
 
@@ -456,6 +458,7 @@ mod rename_tests {
             pinned: false,
             report: None,
             image: None,
+            poll: None,
         };
         db.save_message(&m).unwrap();
         assert!(db.delete_channel(general).unwrap());
@@ -588,6 +591,7 @@ mod member_id_tests {
             pinned: false,
             report: None,
             image: None,
+            poll: None,
         })
         .unwrap();
         assert!(db.legacy_ids().unwrap().contains(&"alice".to_string()));
@@ -1034,6 +1038,7 @@ mod message_visibility_tests {
             pinned: false,
             report: None,
             image: None,
+            poll: None,
         };
         let id = db.save_message(&m).unwrap();
         assert!(db.rename_channel(general, "lobby").unwrap());
@@ -1092,6 +1097,7 @@ mod custom_emoji_tests {
             pinned: false,
             report: None,
             image: None,
+            poll: None,
         };
         let message = db.save_message(&m).unwrap();
         db.toggle_reaction(message, ":party:", "bob").unwrap();
@@ -1104,3 +1110,111 @@ mod custom_emoji_tests {
     }
 }
 
+mod poll_tests {
+    use super::super::*;
+
+    /// A message in a channel, by its name. The channel is created if needed.
+    fn message(db: &Db, channel: &str, author: &str, text: &str) -> ChatMessage {
+        ChatMessage {
+            id: 0,
+            channel_id: db.ensure_channel(channel).unwrap(),
+            channel: channel.into(),
+            author: author.into(),
+            author_id: author.into(),
+            text: text.into(),
+            timestamp: 1,
+            edited: false,
+            reactions: vec![],
+            reply: None,
+            pinned: false,
+            report: None,
+            image: None,
+            poll: None,
+        }
+    }
+
+    /// A poll in a channel, with its options, lasting until `ends`.
+    fn poll_message(db: &Db, channel: &str, question: &str, options: &[&str], ends: u64) -> i64 {
+        let mut m = message(db, channel, "alice", question);
+        m.poll = Some(common::Poll {
+            options: options.iter().map(|o| common::PollOption { text: o.to_string(), voters: Vec::new() }).collect(),
+            ends,
+            multiple: false,
+        });
+        db.save_message(&m).unwrap()
+    }
+
+    fn voters(poll: &common::Poll) -> Vec<Vec<String>> {
+        poll.options.iter().map(|o| o.voters.clone()).collect()
+    }
+
+    #[test]
+    fn a_poll_keeps_its_options_and_end_time_and_loads_with_the_message() {
+        let db = Db::open(":memory:").unwrap();
+        let id = poll_message(&db, "general", "Lunch?", &["pizza", "soup"], 1000);
+        let loaded = db.history(db.ensure_channel("general").unwrap()).unwrap();
+        let poll = loaded.iter().find(|m| m.id == id).unwrap().poll.clone().unwrap();
+        assert_eq!(poll.options.iter().map(|o| o.text.as_str()).collect::<Vec<_>>(), ["pizza", "soup"]);
+        assert_eq!(poll.ends, 1000);
+        assert!(loaded.iter().find(|m| m.id == id).unwrap().text == "Lunch?", "the question is the message text");
+    }
+
+    #[test]
+    fn a_member_votes_once_and_a_new_vote_replaces_the_old_one() {
+        let db = Db::open(":memory:").unwrap();
+        let id = poll_message(&db, "general", "Lunch?", &["pizza", "soup"], 1000);
+        let first = db.vote(id, 0, "bob", 500).unwrap();
+        assert!(matches!(first, VoteOutcome::Voted { .. }));
+        let second = db.vote(id, 1, "bob", 500).unwrap();
+        match second {
+            VoteOutcome::Voted { poll, .. } => {
+                assert_eq!(voters(&poll), vec![Vec::<String>::new(), vec!["bob".to_string()]], "bob's new choice is the only one counted");
+            }
+            other => panic!("the vote is counted: {other:?}"),
+        }
+        let loaded = db.history(db.ensure_channel("general").unwrap()).unwrap();
+        let poll = loaded.iter().find(|m| m.id == id).unwrap().poll.clone().unwrap();
+        assert_eq!(voters(&poll), vec![Vec::<String>::new(), vec!["bob".to_string()]]);
+    }
+
+    #[test]
+    fn votes_after_the_end_time_and_for_unknown_options_are_refused() {
+        let db = Db::open(":memory:").unwrap();
+        let id = poll_message(&db, "general", "Lunch?", &["pizza", "soup"], 1000);
+        assert_eq!(db.vote(id, 5, "bob", 500).unwrap(), VoteOutcome::NoSuchOption);
+        assert_eq!(db.vote(id, 0, "bob", 1000).unwrap(), VoteOutcome::Closed, "voting ends at the end time");
+        let plain = message(&db, "general", "alice", "just text");
+        let plain_id = db.save_message(&plain).unwrap();
+        assert_eq!(db.vote(plain_id, 0, "bob", 500).unwrap(), VoteOutcome::NotAPoll);
+        assert_eq!(db.vote(9999, 0, "bob", 500).unwrap(), VoteOutcome::NoMessage);
+    }
+
+    #[test]
+    fn on_a_poll_with_several_answers_each_choice_is_added_or_taken_off() {
+        let db = Db::open(":memory:").unwrap();
+        let mut m = message(&db, "general", "alice", "Pick any");
+        m.poll = Some(common::Poll {
+            options: vec![
+                common::PollOption { text: "pizza".into(), voters: Vec::new() },
+                common::PollOption { text: "soup".into(), voters: Vec::new() },
+            ],
+            ends: 1000,
+            multiple: true,
+        });
+        let id = db.save_message(&m).unwrap();
+        db.vote(id, 0, "bob", 500).unwrap();
+        let both = db.vote(id, 1, "bob", 500).unwrap();
+        match both {
+            VoteOutcome::Voted { poll, .. } => {
+                assert_eq!(voters(&poll), vec![vec!["bob".to_string()], vec!["bob".to_string()]], "both choices count");
+            }
+            other => panic!("the vote is counted: {other:?}"),
+        }
+        match db.vote(id, 0, "bob", 500).unwrap() {
+            VoteOutcome::Voted { poll, .. } => {
+                assert_eq!(voters(&poll), vec![Vec::<String>::new(), vec!["bob".to_string()]], "choosing again takes it off");
+            }
+            other => panic!("the vote is counted: {other:?}"),
+        }
+    }
+}
