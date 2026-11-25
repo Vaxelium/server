@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::{
-    perm, AuthReply, AuthRequest, ChannelRef, ChatMessage, ClientMsg, RoleInfo, ServerMsg, UserStatus,
+    perm, AttachmentDraft, AuthReply, AuthRequest, ChannelRef, ChatMessage, ClientMsg, RoleInfo, ServerMsg, UserStatus,
     DEFAULT_ADDR, DEFAULT_AUTH_ADDR, DISCOVERY_PORT, EVERYONE_ROLE, MAX_ROLE_NAME_LEN, MAX_SERVER_DESCRIPTION_LEN,
-    MAX_SERVER_ICON_LEN,
+    MAX_ATTACHMENT_BYTES, MAX_SERVER_ICON_LEN,
 };
 use db::Db;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -474,6 +474,9 @@ where
     send(&mut writer, &ServerMsg::Roles { roles }).await?;
     let badges = state.lock().unwrap().db.badge_list()?;
     send(&mut writer, &ServerMsg::Badges { badges }).await?;
+    // Every member needs the upload limits to know what their picker may send.
+    let settings = state.lock().unwrap().db.upload_settings()?;
+    send(&mut writer, &ServerMsg::UploadSettings { settings }).await?;
     let emoji = emoji_list(&state)?;
     send(&mut writer, &ServerMsg::CustomEmoji { emoji }).await?;
     let overrides = state.lock().unwrap().db.channel_overrides()?;
@@ -566,6 +569,7 @@ where
                 report: None,
                 image,
                 poll: None,
+                attachment: None,
             };
             message.id = state.lock().unwrap().db.save_message(&message)?;
             let _ = tx.send(ServerMsg::Message { message });
@@ -1056,7 +1060,7 @@ where
                         }
                     }
 
-                    ClientMsg::Say { text, reply_to, channel: target, poll } => {
+                    ClientMsg::Say { text, reply_to, channel: target, poll, attachment } => {
                         // A forwarded message goes to the channel it names, which may not be the one joined.
                         let channel_id = target.filter(|id| *id != 0).unwrap_or(channel_id);
                         // A flagged name is reported, and refused if the rule blocks, only when its member
@@ -1091,7 +1095,24 @@ where
                             continue;
                         }
                         let text = text.trim().to_string();
-                        if text.is_empty() {
+                        let uploads = state.lock().unwrap().db.upload_settings()?;
+                        // A file can be sent without text, but a message with neither is dropped.
+                        let file = match attachment
+                            .as_ref()
+                            .map(|draft| check_attachment(draft, &uploads))
+                            .transpose()
+                        {
+                            Ok(file) => file,
+                            Err(reason) => {
+                                send(&mut writer, &ServerMsg::Error { text: reason }).await?;
+                                continue;
+                            }
+                        };
+                        if text.is_empty() && file.is_none() {
+                            continue;
+                        }
+                        if file.is_some() && poll.is_some() {
+                            send(&mut writer, &ServerMsg::Error { text: "a poll cannot have a file".into() }).await?;
                             continue;
                         }
                         if text.chars().count() > MAX_TEXT_LEN {
@@ -1195,12 +1216,16 @@ where
                             report: None,
                             image: None,
                             poll,
+                            attachment: file.as_ref().map(|(info, _)| info.clone()),
                         };
                         // A reply must answer a message in the same channel; anything else is sent plain.
                         if let Some(id) = reply_to {
                             message.reply = state.lock().unwrap().db.reply_ref(id, channel_id)?;
                         }
                         message.id = state.lock().unwrap().db.save_message(&message)?;
+                        if let Some((info, data)) = &file {
+                            state.lock().unwrap().db.save_attachment(message.id, info, data)?;
+                        }
                         // Everyone who has read this channel may have a new mention.
                         let readers = state.lock().unwrap().db.readers_of(channel_id)?;
                         report_mentions(&state, &auth_addr, readers);
@@ -1208,6 +1233,24 @@ where
                             state.lock().unwrap().slow_last.insert((channel_id, user.clone()), now_secs());
                         }
                         let _ = tx.send(ServerMsg::Message { message });
+                    }
+                    ClientMsg::GetAttachment { message: id } => {
+                        // Only the members who may view the message's channel may have its file.
+                        let channel = state.lock().unwrap().db.message_channel_id(id)?;
+                        let allowed = match channel {
+                            Some(channel) => Access::new(&state.lock().unwrap().db, &user)?.allows(channel, perm::VIEW_CHANNEL),
+                            None => false,
+                        };
+                        let found = if allowed { state.lock().unwrap().db.attachment(id)? } else { None };
+                        match found {
+                            Some((_, bytes)) => {
+                                let data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+                                send(&mut writer, &ServerMsg::Attachment { message: id, data }).await?;
+                            }
+                            None => {
+                                send(&mut writer, &ServerMsg::Error { text: "that file is not there any more".into() }).await?;
+                            }
+                        }
                     }
                     ClientMsg::SetProfileStatus { text } => {
                         let text: String = text.trim().chars().take(common::MAX_STATUS_TEXT_LEN).collect();
@@ -1631,6 +1674,26 @@ where
                             let _ = tx.send(ServerMsg::Roles { roles: s.db.role_list()? });
                         }
                         send(&mut writer, &ServerMsg::SystemMessages { settings }).await?;
+                    }
+                    ClientMsg::GetUploadSettings => {
+                        if !may(&state, &user, perm::MANAGE_SERVER)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_SYSTEM_PERMISSION.into() }).await?;
+                            continue;
+                        }
+                        let settings = state.lock().unwrap().db.upload_settings()?;
+                        send(&mut writer, &ServerMsg::UploadSettings { settings }).await?;
+                    }
+                    ClientMsg::SetUploadSettings { settings } => {
+                        if !may(&state, &user, perm::MANAGE_SERVER)? {
+                            send(&mut writer, &ServerMsg::Error { text: NO_SYSTEM_PERMISSION.into() }).await?;
+                            continue;
+                        }
+                        if !common::UPLOAD_SIZES_MB.contains(&settings.max_mb) {
+                            send(&mut writer, &ServerMsg::Error { text: "that file size is not offered".into() }).await?;
+                            continue;
+                        }
+                        state.lock().unwrap().db.set_upload_settings(&settings)?;
+                        send(&mut writer, &ServerMsg::UploadSettings { settings }).await?;
                     }
                     ClientMsg::Pin { id, pinned } => {
                         // Blocked without a notice: AutoMod only speaks up when a message is sent.
@@ -2271,8 +2334,10 @@ async fn send_snapshot<W: AsyncWrite + Unpin>(writer: &mut W, state: &SharedStat
         )
     };
     let emoji = emoji_list(state)?;
+    let uploads = state.lock().unwrap().db.upload_settings()?;
     send(writer, &ServerMsg::Roles { roles }).await?;
     send(writer, &ServerMsg::Badges { badges }).await?;
+    send(writer, &ServerMsg::UploadSettings { settings: uploads }).await?;
     send(writer, &ServerMsg::CustomEmoji { emoji }).await?;
     send(writer, &ServerMsg::ChannelOverrides { overrides }).await?;
     send(writer, &ServerMsg::SlowModes { modes }).await?;
@@ -2686,6 +2751,7 @@ fn automod_post(
             report,
             image: None,
             poll: None,
+            attachment: None,
         };
         message.id = s.db.save_message(&message)?;
         message
@@ -2907,6 +2973,37 @@ fn mention_refusal(
 /// Says the channel cannot be used by this member, for the message that refuses them.
 const CANNOT_VIEW: &str = "you can't view that channel";
 const CANNOT_SEND: &str = "you can't send messages in that channel";
+/// Checks a file a member sends against the server's upload settings: uploads must be on, the file must be base64,
+/// not empty, within the size the server allows, and a picture when only pictures are allowed. Its name is tidied
+/// and its type is worked out from its contents. Returns the details kept and the bytes saved.
+fn check_attachment(
+    draft: &AttachmentDraft,
+    uploads: &common::UploadSettings,
+) -> Result<(common::Attachment, Vec<u8>), String> {
+    if !uploads.enabled {
+        return Err("file uploads are turned off on this server".into());
+    }
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &draft.data)
+        .map_err(|_| "that file could not be read".to_string())?;
+    if bytes.is_empty() {
+        return Err("that file is empty".into());
+    }
+    let limit = uploads.max_mb as usize * 1024 * 1024;
+    if bytes.len() > limit.min(MAX_ATTACHMENT_BYTES) {
+        return Err(format!("files can be at most {} MB", uploads.max_mb));
+    }
+    let mime = common::sniff_mime(&bytes);
+    if uploads.images_only && !common::can_preview(mime) {
+        return Err("only pictures can be sent on this server".into());
+    }
+    let info = common::Attachment {
+        name: common::attachment_file_name(&draft.name),
+        mime: mime.to_string(),
+        size: bytes.len() as u64,
+    };
+    Ok((info, bytes))
+}
+
 const NO_POLL_PERMISSION: &str = "you need the Manage Polls permission to make a poll";
 const NO_SCHEDULE_PERMISSION: &str = "you need the Manage Messages permission to schedule a message";
 
@@ -3573,6 +3670,7 @@ fn post_scheduled(
             report: None,
             image: None,
             poll: None,
+            attachment: None,
         };
         message.id = state.lock().unwrap().db.save_message(&message)?;
         let readers = state.lock().unwrap().db.readers_of(channel_id)?;

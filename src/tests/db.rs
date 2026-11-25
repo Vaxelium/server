@@ -18,7 +18,41 @@ mod tests {
             report: None,
             image: None,
             poll: None,
+            attachment: None,
         }
+    }
+
+    #[test]
+    fn a_message_keeps_its_file_and_history_shows_its_details_but_not_its_contents() {
+        let db = Db::open(":memory:").unwrap();
+        let general = db.ensure_channel("general").unwrap();
+        let id = db.save_message(&message(&db, "general", "bob", "")).unwrap();
+        let file = common::Attachment { name: "pic.png".into(), mime: "image/png".into(), size: 3 };
+        db.save_attachment(id, &file, &[1, 2, 3]).unwrap();
+
+        let history = db.history(general).unwrap();
+        assert_eq!(history[0].attachment, Some(file.clone()), "history carries the details");
+        assert_eq!(db.attachment(id).unwrap(), Some((file, vec![1, 2, 3])), "the contents come from the file");
+
+        db.save_message(&message(&db, "general", "bob", "plain")).unwrap();
+        assert!(db.history(general).unwrap()[1].attachment.is_none(), "a message without a file has none");
+        assert!(db.attachment(id + 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn deleting_a_message_or_its_channel_deletes_its_file() {
+        let db = Db::open(":memory:").unwrap();
+        let general = db.ensure_channel("general").unwrap();
+        let file = common::Attachment { name: "a.txt".into(), mime: "application/octet-stream".into(), size: 1 };
+        let one = db.save_message(&message(&db, "general", "bob", "one")).unwrap();
+        db.save_attachment(one, &file, &[9]).unwrap();
+        db.delete_message(one, "bob", false).unwrap();
+        assert!(db.attachment(one).unwrap().is_none(), "the file goes with its message");
+
+        let two = db.save_message(&message(&db, "general", "bob", "two")).unwrap();
+        db.save_attachment(two, &file, &[9]).unwrap();
+        db.delete_channel(general).unwrap();
+        assert!(db.attachment(two).unwrap().is_none(), "the file goes with its channel");
     }
 
     #[test]
@@ -231,6 +265,19 @@ mod tests {
     }
 
     #[test]
+    fn upload_settings_default_to_on_at_eight_megabytes_and_are_kept() {
+        let db = Db::open(":memory:").unwrap();
+        assert_eq!(db.upload_settings().unwrap(), common::UploadSettings::default());
+        let settings = common::UploadSettings {
+            enabled: false,
+            max_mb: 2,
+            images_only: true,
+        };
+        db.set_upload_settings(&settings).unwrap();
+        assert_eq!(db.upload_settings().unwrap(), settings);
+    }
+
+    #[test]
     fn automod_rules_are_kept() {
         let db = Db::open(":memory:").unwrap();
         assert_eq!(
@@ -424,6 +471,7 @@ mod rename_tests {
             report: None,
             image: None,
             poll: None,
+            attachment: None,
         };
         db.save_message(&m).unwrap();
 
@@ -459,6 +507,7 @@ mod rename_tests {
             report: None,
             image: None,
             poll: None,
+            attachment: None,
         };
         db.save_message(&m).unwrap();
         assert!(db.delete_channel(general).unwrap());
@@ -592,6 +641,7 @@ mod member_id_tests {
             report: None,
             image: None,
             poll: None,
+            attachment: None,
         })
         .unwrap();
         assert!(db.legacy_ids().unwrap().contains(&"alice".to_string()));
@@ -1039,6 +1089,7 @@ mod message_visibility_tests {
             report: None,
             image: None,
             poll: None,
+            attachment: None,
         };
         let id = db.save_message(&m).unwrap();
         assert!(db.rename_channel(general, "lobby").unwrap());
@@ -1098,6 +1149,7 @@ mod custom_emoji_tests {
             report: None,
             image: None,
             poll: None,
+            attachment: None,
         };
         let message = db.save_message(&m).unwrap();
         db.toggle_reaction(message, ":party:", "bob").unwrap();
@@ -1130,6 +1182,7 @@ mod poll_tests {
             report: None,
             image: None,
             poll: None,
+            attachment: None,
         }
     }
 
