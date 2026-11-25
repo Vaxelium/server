@@ -117,6 +117,13 @@ CREATE TABLE IF NOT EXISTS custom_emoji (
     name  TEXT NOT NULL UNIQUE,
     image BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS attachments (
+    message_id INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL,
+    mime       TEXT NOT NULL,
+    size       INTEGER NOT NULL,
+    data       BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS member_badges (
     user_id  TEXT NOT NULL,
     badge_id INTEGER NOT NULL,
@@ -833,6 +840,22 @@ impl Db {
         self.set_server_info("system_messages", &json)
     }
 
+    /// The server's file upload settings. A server that never set any gets the defaults.
+    pub fn upload_settings(&self) -> rusqlite::Result<common::UploadSettings> {
+        let stored: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM server_info WHERE key = 'upload_settings'", [], |row| row.get(0))
+            .optional()?;
+        Ok(stored
+            .and_then(|json| serde_json::from_str::<common::UploadSettings>(&json).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn set_upload_settings(&self, settings: &common::UploadSettings) -> rusqlite::Result<()> {
+        let json = serde_json::to_string(settings).unwrap_or_default();
+        self.set_server_info("upload_settings", &json)
+    }
+
     /// The server icon as base64 PNG, or `None` when the server has no icon.
     pub fn server_icon(&self) -> rusqlite::Result<Option<String>> {
         let icon: String =
@@ -1292,6 +1315,10 @@ impl Db {
         let matches = "channel_id = ?1 OR (channel_id IS NULL AND channel = ?2)";
         self.conn.execute(
             &format!("DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE {matches})"),
+            params![id, name],
+        )?;
+        self.conn.execute(
+            &format!("DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE {matches})"),
             params![id, name],
         )?;
         self.conn
@@ -1815,6 +1842,63 @@ impl Db {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Keeps the file a message carries. Called once the message itself is saved.
+    pub fn save_attachment(&self, message: i64, file: &common::Attachment, data: &[u8]) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO attachments (message_id, name, mime, size, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![message, file.name, file.mime, file.size as i64, data],
+        )?;
+        Ok(())
+    }
+
+    /// The file a message carries, with its contents, or `None` when it has none.
+    pub fn attachment(&self, message: i64) -> rusqlite::Result<Option<(common::Attachment, Vec<u8>)>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT name, mime, size, data FROM attachments WHERE message_id = ?1",
+                params![message],
+                |row| {
+                    Ok((
+                        common::Attachment {
+                            name: row.get(0)?,
+                            mime: row.get(1)?,
+                            size: row.get::<_, i64>(2)? as u64,
+                        },
+                        row.get(3)?,
+                    ))
+                },
+            )
+            .optional()
+    }
+
+    /// The files carried by these messages, without their contents, by message id.
+    fn attachments_for(&self, ids: &[i64]) -> rusqlite::Result<std::collections::HashMap<i64, common::Attachment>> {
+        let mut files = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(files);
+        }
+        let list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT message_id, name, mime, size FROM attachments WHERE message_id IN ({list})"
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                common::Attachment {
+                    name: row.get(1)?,
+                    mime: row.get(2)?,
+                    size: row.get::<_, i64>(3)? as u64,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (id, file) = row?;
+            files.insert(id, file);
+        }
+        Ok(files)
+    }
+
     /// The pictures saved with these messages, by message id.
     fn images_for(&self, ids: &[i64]) -> rusqlite::Result<std::collections::HashMap<i64, Vec<u8>>> {
         let mut images = std::collections::HashMap::new();
@@ -1873,6 +1957,7 @@ impl Db {
         if channel.is_some() {
             self.conn
                 .execute("DELETE FROM reactions WHERE message_id = ?1", params![id])?;
+            self.conn.execute("DELETE FROM attachments WHERE message_id = ?1", params![id])?;
             self.conn.execute("DELETE FROM messages WHERE id = ?1", params![id])?;
         }
         Ok(channel)
@@ -2217,6 +2302,7 @@ impl Db {
                 poll: row
                     .get::<_, Option<String>>(11)?
                     .and_then(|json| serde_json::from_str(&json).ok()),
+                attachment: None,
             })
         })?;
         let mut messages: Vec<ChatMessage> = rows.collect::<rusqlite::Result<_>>()?;
@@ -2260,9 +2346,11 @@ impl Db {
         }
         // Pictures are only kept for join notices, so most messages have none to load.
         let mut images = self.images_for(&ids)?;
+        let mut files = self.attachments_for(&ids)?;
         for m in &mut messages {
             m.reactions = reactions.remove(&m.id).unwrap_or_default();
             m.image = images.remove(&m.id).map(|png| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png));
+            m.attachment = files.remove(&m.id);
         }
         Ok(messages)
     }

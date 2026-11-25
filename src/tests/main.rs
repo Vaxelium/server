@@ -1,3 +1,31 @@
+mod upload_tests {
+    use super::super::*;
+
+    #[test]
+    fn upload_limits_are_checked_against_the_settings() {
+        let file = |bytes: &[u8]| AttachmentDraft {
+            name: "a.bin".into(),
+            data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
+        };
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0];
+        let mut uploads = common::UploadSettings::default();
+        assert!(check_attachment(&file(&png), &uploads).is_ok());
+
+        uploads.images_only = true;
+        assert!(check_attachment(&file(b"%PDF-1.7"), &uploads).is_err());
+        assert!(check_attachment(&file(&png), &uploads).is_ok());
+
+        uploads.images_only = false;
+        uploads.max_mb = 1;
+        let big = vec![0u8; 1024 * 1024 + 1];
+        assert!(check_attachment(&file(&big), &uploads).is_err());
+        assert!(check_attachment(&file(&vec![0u8; 1024 * 1024]), &uploads).is_ok());
+
+        uploads.enabled = false;
+        assert!(check_attachment(&file(&png), &uploads).is_err());
+    }
+}
+
 mod role_tests {
     use super::super::*;
 
@@ -986,6 +1014,7 @@ mod snapshot_tests {
             .map(|m| match m {
                 ServerMsg::Roles { .. } => "roles",
                 ServerMsg::Badges { .. } => "badges",
+                ServerMsg::UploadSettings { .. } => "upload settings",
                 ServerMsg::CustomEmoji { .. } => "emoji",
                 ServerMsg::ChannelOverrides { .. } => "channel overrides",
                 ServerMsg::SlowModes { .. } => "slow modes",
@@ -996,7 +1025,16 @@ mod snapshot_tests {
             .collect();
         assert_eq!(
             kinds,
-            ["roles", "badges", "emoji", "channel overrides", "slow modes", "category overrides", "member overrides"]
+            [
+                "roles",
+                "badges",
+                "upload settings",
+                "emoji",
+                "channel overrides",
+                "slow modes",
+                "category overrides",
+                "member overrides"
+            ]
         );
     }
 
