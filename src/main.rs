@@ -1,6 +1,7 @@
 mod card;
 mod db;
 mod discovery;
+mod embed;
 mod emoji_image;
 mod web;
 
@@ -570,6 +571,7 @@ where
                 image,
                 poll: None,
                 attachment: None,
+                embed: None,
             };
             message.id = state.lock().unwrap().db.save_message(&message)?;
             let _ = tx.send(ServerMsg::Message { message });
@@ -1217,6 +1219,7 @@ where
                             image: None,
                             poll,
                             attachment: file.as_ref().map(|(info, _)| info.clone()),
+                            embed: None,
                         };
                         // A reply must answer a message in the same channel; anything else is sent plain.
                         if let Some(id) = reply_to {
@@ -1232,7 +1235,24 @@ where
                         if slow > 0 {
                             state.lock().unwrap().slow_last.insert((channel_id, user.clone()), now_secs());
                         }
+                        let link = common::first_link(&message.text);
+                        let message_id = message.id;
                         let _ = tx.send(ServerMsg::Message { message });
+                        // The first link is fetched in the background, so the message is not held up. Its preview
+                        // follows once the page is in, and is kept with the message for later joins.
+                        if let Some(link) = link {
+                            let (state, tx) = (state.clone(), tx.clone());
+                            tokio::spawn(async move {
+                                let Some(embed) = embed::fetch(&link).await else { return };
+                                let s = state.lock().unwrap();
+                                // A message deleted while its page was fetched has nothing to show.
+                                if let Ok(Some(channel_id)) = s.db.message_channel_id(message_id) {
+                                    if s.db.save_embed(message_id, &embed).is_ok() {
+                                        let _ = tx.send(ServerMsg::Embed { channel_id, message: message_id, embed });
+                                    }
+                                }
+                            });
+                        }
                     }
                     ClientMsg::GetAttachment { message: id } => {
                         // Only the members who may view the message's channel may have its file.
@@ -1859,6 +1879,11 @@ where
                     Ok(ServerMsg::MessageEdited { channel_id: c, id, text }) if c == channel_id => {
                         if Access::new(&state.lock().unwrap().db, &user)?.allows(c, perm::VIEW_CHANNEL) {
                             send(&mut writer, &ServerMsg::MessageEdited { channel_id: c, id, text }).await?;
+                        }
+                    }
+                    Ok(ServerMsg::Embed { channel_id: c, message, embed }) if c == channel_id => {
+                        if Access::new(&state.lock().unwrap().db, &user)?.allows(c, perm::VIEW_CHANNEL) {
+                            send(&mut writer, &ServerMsg::Embed { channel_id: c, message, embed }).await?;
                         }
                     }
                     Ok(ServerMsg::MessageDeleted { channel_id: c, id }) if c == channel_id => {
@@ -2752,6 +2777,7 @@ fn automod_post(
             image: None,
             poll: None,
             attachment: None,
+            embed: None,
         };
         message.id = s.db.save_message(&message)?;
         message
@@ -3671,6 +3697,7 @@ fn post_scheduled(
             image: None,
             poll: None,
             attachment: None,
+            embed: None,
         };
         message.id = state.lock().unwrap().db.save_message(&message)?;
         let readers = state.lock().unwrap().db.readers_of(channel_id)?;

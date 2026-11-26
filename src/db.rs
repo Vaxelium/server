@@ -124,6 +124,14 @@ CREATE TABLE IF NOT EXISTS attachments (
     size       INTEGER NOT NULL,
     data       BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS embeds (
+    message_id  INTEGER PRIMARY KEY,
+    url         TEXT NOT NULL,
+    site        TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    description TEXT NOT NULL,
+    image       TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS member_badges (
     user_id  TEXT NOT NULL,
     badge_id INTEGER NOT NULL,
@@ -1321,6 +1329,10 @@ impl Db {
             &format!("DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE {matches})"),
             params![id, name],
         )?;
+        self.conn.execute(
+            &format!("DELETE FROM embeds WHERE message_id IN (SELECT id FROM messages WHERE {matches})"),
+            params![id, name],
+        )?;
         self.conn
             .execute(&format!("DELETE FROM messages WHERE {matches}"), params![id, name])?;
         Ok(self.conn.execute("DELETE FROM channels WHERE id = ?1", params![id])? > 0)
@@ -1872,6 +1884,45 @@ impl Db {
             .optional()
     }
 
+    /// Keeps the link preview of a message.
+    pub fn save_embed(&self, message: i64, embed: &common::LinkEmbed) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO embeds (message_id, url, site, title, description, image)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![message, embed.url, embed.site, embed.title, embed.description, embed.image],
+        )?;
+        Ok(())
+    }
+
+    /// The link previews of these messages, by message id.
+    fn embeds_for(&self, ids: &[i64]) -> rusqlite::Result<std::collections::HashMap<i64, common::LinkEmbed>> {
+        let mut embeds = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(embeds);
+        }
+        let list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT message_id, url, site, title, description, image FROM embeds WHERE message_id IN ({list})"
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                common::LinkEmbed {
+                    url: row.get(1)?,
+                    site: row.get(2)?,
+                    title: row.get(3)?,
+                    description: row.get(4)?,
+                    image: row.get(5)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (id, embed) = row?;
+            embeds.insert(id, embed);
+        }
+        Ok(embeds)
+    }
+
     /// The files carried by these messages, without their contents, by message id.
     fn attachments_for(&self, ids: &[i64]) -> rusqlite::Result<std::collections::HashMap<i64, common::Attachment>> {
         let mut files = std::collections::HashMap::new();
@@ -1958,6 +2009,7 @@ impl Db {
             self.conn
                 .execute("DELETE FROM reactions WHERE message_id = ?1", params![id])?;
             self.conn.execute("DELETE FROM attachments WHERE message_id = ?1", params![id])?;
+            self.conn.execute("DELETE FROM embeds WHERE message_id = ?1", params![id])?;
             self.conn.execute("DELETE FROM messages WHERE id = ?1", params![id])?;
         }
         Ok(channel)
@@ -2303,6 +2355,7 @@ impl Db {
                     .get::<_, Option<String>>(11)?
                     .and_then(|json| serde_json::from_str(&json).ok()),
                 attachment: None,
+                embed: None,
             })
         })?;
         let mut messages: Vec<ChatMessage> = rows.collect::<rusqlite::Result<_>>()?;
@@ -2347,10 +2400,12 @@ impl Db {
         // Pictures are only kept for join notices, so most messages have none to load.
         let mut images = self.images_for(&ids)?;
         let mut files = self.attachments_for(&ids)?;
+        let mut embeds = self.embeds_for(&ids)?;
         for m in &mut messages {
             m.reactions = reactions.remove(&m.id).unwrap_or_default();
             m.image = images.remove(&m.id).map(|png| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png));
             m.attachment = files.remove(&m.id);
+            m.embed = embeds.remove(&m.id);
         }
         Ok(messages)
     }
