@@ -19,6 +19,7 @@ mod tests {
             image: None,
             poll: None,
             attachment: None,
+            embed: None,
         }
     }
 
@@ -472,6 +473,7 @@ mod rename_tests {
             image: None,
             poll: None,
             attachment: None,
+            embed: None,
         };
         db.save_message(&m).unwrap();
 
@@ -508,6 +510,7 @@ mod rename_tests {
             image: None,
             poll: None,
             attachment: None,
+            embed: None,
         };
         db.save_message(&m).unwrap();
         assert!(db.delete_channel(general).unwrap());
@@ -642,6 +645,7 @@ mod member_id_tests {
             image: None,
             poll: None,
             attachment: None,
+            embed: None,
         })
         .unwrap();
         assert!(db.legacy_ids().unwrap().contains(&"alice".to_string()));
@@ -1090,6 +1094,7 @@ mod message_visibility_tests {
             image: None,
             poll: None,
             attachment: None,
+            embed: None,
         };
         let id = db.save_message(&m).unwrap();
         assert!(db.rename_channel(general, "lobby").unwrap());
@@ -1150,6 +1155,7 @@ mod custom_emoji_tests {
             image: None,
             poll: None,
             attachment: None,
+            embed: None,
         };
         let message = db.save_message(&m).unwrap();
         db.toggle_reaction(message, ":party:", "bob").unwrap();
@@ -1183,6 +1189,7 @@ mod poll_tests {
             image: None,
             poll: None,
             attachment: None,
+            embed: None,
         }
     }
 
